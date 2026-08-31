@@ -9,8 +9,10 @@ Supports reading and writing Excel files for:
 - Forex rates, Price alerts, Watchlists
 """
 
+import re
 import datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Optional, Union
 
 from openpyxl import Workbook, load_workbook
@@ -489,6 +491,116 @@ def export_all(session: Session, filepath: Union[str, Path]) -> dict[str, int]:
 # =============================================================================
 
 
+# Example rows written into the generated templates. Importers skip a row only
+# when it matches one of these exactly and is the first data row - matching on
+# the name alone used to silently drop legitimate data (any vendor named
+# "Amazon", any spec named "Camera Spec").
+EXAMPLE_ROWS: dict[str, list[str]] = {
+    "vendors": [
+        "Example Vendor",
+        "USD",
+        "SAVE10",
+        "10",
+        "https://example.com",
+        "John Doe",
+        "john@example.com",
+        "+1-555-1234",
+        "https://example.com",
+        "123 Main St",
+        "Suite 100",
+        "New York",
+        "NY",
+        "10001",
+        "USA",
+        "12-3456789",
+        "Net 30",
+    ],
+    "products": ["Example Product", "Example Brand", "Electronics"],
+    "quotes": ["Amazon", "iPhone 15", "Apple", "999.99", "USD", "0"],
+    "specifications": ["Camera Spec", "Specifications for cameras"],
+}
+
+
+def purchase_order_example_row(
+    date: Optional[datetime.date] = None,
+) -> list[str]:
+    """
+    The purchase-order template's example row.
+
+    Args:
+        date: Date to embed; defaults to today
+
+    Returns:
+        The row as written into a freshly generated template
+    """
+    date = date or datetime.date.today()
+    return [
+        f"PO-{date.strftime('%Y%m%d')}-001",
+        "Amazon",
+        "iPhone 15",
+        "1",
+        "999.99",
+        "USD",
+        "0",
+        "0",
+        date.isoformat(),
+        "",
+        "",
+        "",
+        "pending",
+    ]
+
+
+PO_EXAMPLE_NUMBER_PATTERN = re.compile(r"^PO-\d{8}-001$")
+
+
+def _is_purchase_order_example_row(row: tuple, row_num: int) -> bool:
+    """
+    Whether a row is the purchase-order template's untouched example row.
+
+    The example's PO number and order date carry the generation date, so an
+    exact comparison against today's row only recognizes a template imported
+    the same day it was generated. Match the dated fields by shape instead,
+    and everything else exactly.
+    """
+    if row_num != 2:
+        return False
+
+    values = ["" if cell is None else str(cell).strip() for cell in row]
+    example = purchase_order_example_row()
+    values += [""] * (len(example) - len(values))
+
+    if not PO_EXAMPLE_NUMBER_PATTERN.match(values[0]):
+        return False
+
+    # Compare every field except the PO number (0) and order date (8), which
+    # both vary with the generation date.
+    positions = [i for i in range(len(example)) if i not in (0, 8)]
+    if any(values[i] != example[i] for i in positions):
+        return False
+
+    # The order date must still look like a date, or the row has been edited.
+    try:
+        datetime.date.fromisoformat(values[8])
+    except ValueError:
+        return False
+    return True
+
+
+def _is_example_row(row: tuple, example: list[str], row_num: int) -> bool:
+    """
+    Whether a spreadsheet row is the template's untouched example row.
+
+    Only the first data row can be the example, and every populated cell must
+    match, so real data that happens to share a name is imported normally.
+    """
+    if row_num != 2:
+        return False
+    values = ["" if cell is None else str(cell).strip() for cell in row]
+    values += [""] * (len(example) - len(values))
+    return values[: len(example)] == example
+
+
 def generate_vendor_template(filepath: Union[str, Path]) -> None:
     """Generate an Excel template for vendor import."""
     wb = Workbook()
@@ -518,27 +630,7 @@ def generate_vendor_template(filepath: Union[str, Path]) -> None:
     _style_header(ws, len(headers))
 
     # Add example row
-    ws.append(
-        [
-            "Example Vendor",
-            "USD",
-            "SAVE10",
-            "10",
-            "https://example.com",
-            "John Doe",
-            "john@example.com",
-            "+1-555-1234",
-            "https://example.com",
-            "123 Main St",
-            "Suite 100",
-            "New York",
-            "NY",
-            "10001",
-            "USA",
-            "12-3456789",
-            "Net 30",
-        ]
-    )
+    ws.append(EXAMPLE_ROWS["vendors"])
 
     # Add currency validation
     currencies = ["USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF", "CNY"]
@@ -560,7 +652,7 @@ def generate_product_template(
     ws.append(headers)
     _style_header(ws, len(headers))
 
-    ws.append(["Example Product", "Example Brand", "Electronics"])
+    ws.append(EXAMPLE_ROWS["products"])
 
     # Add brand validation if session provided
     if session:
@@ -591,7 +683,7 @@ def generate_quote_template(
     ws.append(headers)
     _style_header(ws, len(headers))
 
-    ws.append(["Amazon", "iPhone 15", "Apple", "999.99", "USD", "0"])
+    ws.append(EXAMPLE_ROWS["quotes"])
 
     # Add validations if session provided
     if session:
@@ -618,7 +710,7 @@ def generate_specification_template(filepath: Union[str, Path]) -> None:
     ws.title = "Specifications"
     ws.append(["Name *", "Description"])
     _style_header(ws, 2)
-    ws.append(["Camera Spec", "Specifications for cameras"])
+    ws.append(EXAMPLE_ROWS["specifications"])
     _auto_width(ws)
 
     # Sheet 2: Features
@@ -672,24 +764,7 @@ def generate_purchase_order_template(
     ws.append(headers)
     _style_header(ws, len(headers))
 
-    today = datetime.date.today().isoformat()
-    ws.append(
-        [
-            f"PO-{datetime.date.today().strftime('%Y%m%d')}-001",
-            "Amazon",
-            "iPhone 15",
-            "1",
-            "999.99",
-            "USD",
-            "0",
-            "0",
-            today,
-            "",
-            "",
-            "",
-            "pending",
-        ]
-    )
+    ws.append(purchase_order_example_row())
 
     # Add validations
     if session:
@@ -776,7 +851,7 @@ def import_vendors(
 
         try:
             name = str(row[0]).strip()
-            if name.startswith("Example"):  # Skip example rows
+            if _is_example_row(row, EXAMPLE_ROWS["vendors"], row_num):
                 continue
 
             VendorService.create(
@@ -830,7 +905,7 @@ def import_products(
             name = str(row[0]).strip()
             brand_name = str(row[1]).strip() if row[1] else None
 
-            if name.startswith("Example"):
+            if _is_example_row(row, EXAMPLE_ROWS["products"], row_num):
                 continue
 
             if not brand_name:
@@ -875,7 +950,7 @@ def import_quotes(
             brand_name = str(row[2]).strip() if row[2] else None
             price = _parse_float(row[3])
 
-            if vendor_name.startswith("Example") or vendor_name == "Amazon":
+            if _is_example_row(row, EXAMPLE_ROWS["quotes"], row_num):
                 continue
 
             quote = QuoteService.create(
@@ -919,7 +994,7 @@ def import_specifications(
 
         try:
             name = str(row[0]).strip()
-            if name.startswith("Example") or name == "Camera Spec":
+            if _is_example_row(row, EXAMPLE_ROWS["specifications"], row_num):
                 continue
 
             spec = SpecificationService.create(
@@ -993,7 +1068,7 @@ def import_purchase_orders(
             vendor_name = str(row[1]).strip()
             product_name = str(row[2]).strip()
 
-            if po_number.startswith("PO-") and vendor_name == "Amazon":
+            if _is_purchase_order_example_row(row, row_num):
                 continue
 
             PurchaseOrderService.create(
@@ -1058,7 +1133,10 @@ IMPORTERS = {
     "pos": import_purchase_orders,
 }
 
-TEMPLATE_GENERATORS = {
+# Template generators keyed by table name. The signatures differ - the ones for
+# tables with data-validation dropdowns also take a session - so callers must
+# dispatch on the table name.
+TEMPLATE_GENERATORS: dict[str, Callable[..., None]] = {
     "vendors": generate_vendor_template,
     "products": generate_product_template,
     "quotes": generate_quote_template,

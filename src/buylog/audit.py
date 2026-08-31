@@ -24,18 +24,29 @@ from .models import Base
 audit_logger = logging.getLogger("buylog.audit")
 audit_logger.setLevel(logging.INFO)
 
-# Ensure audit log directory exists
+# Path of the audit log file; the handler is attached lazily on first write so
+# that importing this module has no filesystem side effects.
 audit_log_path = Path.home() / ".buylog" / "audit.log"
-audit_log_path.parent.mkdir(parents=True, exist_ok=True)
 
-# File handler for audit logs (always enabled)
-audit_handler = logging.FileHandler(audit_log_path)
-audit_handler.setLevel(logging.INFO)
-audit_formatter = logging.Formatter(
-    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-audit_handler.setFormatter(audit_formatter)
-audit_logger.addHandler(audit_handler)
+_file_handler_attached = False
+
+
+def _ensure_file_handler() -> None:
+    """Attach the audit file handler on first use."""
+    global _file_handler_attached
+    if _file_handler_attached:
+        return
+    _file_handler_attached = True
+    try:
+        audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(audit_log_path)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        audit_logger.addHandler(handler)
+    except OSError as e:  # pragma: no cover - unwritable home directory
+        audit_logger.warning(f"Audit file logging disabled: {e}")
 
 
 class AuditAction(str, Enum):
@@ -130,6 +141,7 @@ class AuditService:
         if details:
             log_message += f", Details={details}"
 
+        _ensure_file_handler()
         if success:
             audit_logger.info(log_message)
         else:
@@ -150,7 +162,14 @@ class AuditService:
                 session.add(audit_entry)
                 session.commit()
             except Exception as e:
-                # Don't let audit logging failure break the application
+                # Don't let audit logging failure break the application. The
+                # failed flush leaves the session in a rolled-back state, so
+                # roll back explicitly: otherwise every later use of this
+                # session raises PendingRollbackError.
+                try:
+                    session.rollback()
+                except Exception:  # pragma: no cover - rollback should not fail
+                    pass
                 audit_logger.error(f"Failed to write audit log to database: {e}")
 
     @staticmethod

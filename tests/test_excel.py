@@ -343,3 +343,98 @@ def test_import_duplicate_vendor(dbsession):
         assert success == 0
         assert len(errors) == 1
         assert "already exists" in errors[0]
+
+
+def test_import_does_not_skip_a_real_vendor_named_amazon(tmp_path, dbsession):
+    """Regression: any quote row whose vendor was "Amazon" was silently dropped."""
+    from openpyxl import Workbook
+
+    from buylog.excel import import_quotes
+    from buylog.services import ProductService, VendorService
+
+    VendorService.create(dbsession, "Amazon")
+    ProductService.create(dbsession, "iPhone 15", "Apple")
+
+    path = tmp_path / "quotes.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(
+        ["Vendor *", "Product *", "Brand (if new)", "Price *", "Currency", "Shipping"]
+    )
+    ws.append(["Amazon", "iPhone 15", "Apple", "1299.00", "USD", "0"])
+    wb.save(path)
+
+    count, errors = import_quotes(dbsession, path)
+
+    assert errors == []
+    assert count == 1
+
+
+def test_import_skips_the_untouched_template_example_row(tmp_path, dbsession):
+    from openpyxl import load_workbook
+
+    from buylog.excel import generate_quote_template, import_quotes
+
+    path = tmp_path / "quotes-template.xlsx"
+    generate_quote_template(path)
+    # sanity: the template really does carry one example row
+    assert load_workbook(path).active.max_row == 2
+
+    count, errors = import_quotes(dbsession, path)
+
+    assert count == 0
+    assert errors == []
+
+
+def test_po_import_skips_a_template_generated_on_another_day(tmp_path, dbsession):
+    """Regression: the PO example row was only recognized on generation day."""
+    import datetime
+
+    from openpyxl import Workbook
+
+    from buylog.excel import import_purchase_orders, purchase_order_example_row
+    from buylog.services import ProductService, VendorService
+
+    VendorService.create(dbsession, "Amazon")
+    ProductService.create(dbsession, "iPhone 15", "Apple")
+
+    path = tmp_path / "po.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["PO Number *", "Vendor *", "Product *", "Quantity", "Unit Price *"])
+    # A template generated long ago, imported today.
+    ws.append(purchase_order_example_row(datetime.date(2020, 1, 1)))
+    wb.save(path)
+
+    count, errors = import_purchase_orders(dbsession, path)
+
+    assert count == 0
+    assert errors == []
+
+
+def test_po_import_keeps_a_real_order_that_looks_like_the_example(tmp_path, dbsession):
+    """A genuine Amazon order must not be mistaken for the example row."""
+    import datetime
+
+    from openpyxl import Workbook
+
+    from buylog.excel import import_purchase_orders, purchase_order_example_row
+    from buylog.services import ProductService, VendorService
+
+    VendorService.create(dbsession, "Amazon")
+    ProductService.create(dbsession, "iPhone 15", "Apple")
+
+    row = purchase_order_example_row(datetime.date(2026, 5, 4))
+    row[4] = "1299.00"  # a real price, not the template's 999.99
+
+    path = tmp_path / "po.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["PO Number *", "Vendor *", "Product *", "Quantity", "Unit Price *"])
+    ws.append(row)
+    wb.save(path)
+
+    count, errors = import_purchase_orders(dbsession, path)
+
+    assert errors == []
+    assert count == 1

@@ -7,11 +7,16 @@ A Python tool to help you keep track of what you buy and want to buy.
 - **Command Line Interface (CLI)** - Full CRUD operations for managing brands, products, vendors, and quotes
 - **Text User Interface (TUI)** - Interactive terminal UI built with Textual
 - **Data Persistence** - SQLAlchemy ORM with SQLite support
-- **Multi-currency Support** - Forex rate tracking with automatic currency conversion
+- **Multi-currency Support** - Forex rate tracking with automatic currency conversion,
+  automatic rate refresh from a public API, and source-currency display throughout
 - **Quote Analysis** - Best price highlighting, price history tracking, and price alerts
+- **Automation** - `buylog check` for cron, with notifications via ntfy, webhook,
+  desktop or email; scheduled re-scraping of tracked product URLs
+- **Spend Analytics** - What you actually spent, by month, vendor and category,
+  plus how each purchase compared to the best price on record
 - **Service Layer** - Business logic separation with validation and error handling
 - **Audit Logging** - Track entity creation, updates, and deletions
-- **Testing** - pytest-based test suite with factory pattern
+- **Testing** - pytest-based test suite with transactional fixtures
 
 ## Installation
 
@@ -132,16 +137,17 @@ buylog watchlist update 1 --target-price 750         # Update target price
 buylog watchlist remove 1                            # Remove from watchlist
 
 # Import data
-buylog import quotes data.csv                        # Import quotes from CSV
-buylog import quotes data.json                       # Import quotes from JSON
-buylog import quotes data.csv --no-create            # Don't create missing entities
+buylog import data.csv                               # Import quotes from CSV
+buylog import data.json                              # Import quotes from JSON
+buylog import data.xlsx -t vendors                   # Import a table from Excel
+# Missing brands/products/vendors referenced by a row are created automatically.
 
 # Export data
-buylog export quotes --format csv --file quotes.csv   # Export to CSV
-buylog export quotes --format markdown --file report.md  # Export to Markdown
-buylog export quotes --filter "iPhone"               # Export filtered quotes
-buylog export products --file products.csv           # Export products
-buylog export vendors --file vendors.csv             # Export vendors
+buylog export -o buylog-db.xlsx                      # Export all tables to Excel
+buylog export -t quotes -o quotes.xlsx               # Export a single table
+buylog export -t quotes --format csv -o quotes.csv   # Export to CSV
+buylog export -t products -o products.csv --format csv
+buylog export -t vendors -o vendors.csv --format csv
 
 # Backup and restore
 buylog backup                                        # Create timestamped backup
@@ -183,6 +189,7 @@ buylog report price-comparison --filter "iPhone"     # Filter by product name
 buylog report price-comparison --output report.html  # Save to file
 buylog report purchase-summary --output summary.html # Summary by status
 buylog report vendor-analysis --output vendors.html  # Vendor statistics
+buylog report spend-analysis --output spend.html     # What was actually spent
 
 # Excel export
 buylog export -t vendors -o vendors.xlsx             # Export vendors to Excel
@@ -207,8 +214,11 @@ buylog template -t purchase_orders -f xlsx           # PO template with vendor/p
 # Purchase orders
 buylog po create PO-001 --vendor "Amazon" --product "iPhone 15" --price 999.99
 buylog po create PO-002 --vendor "Amazon" --product "iPhone 15" --price 999.99 --quantity 2
+buylog po create PO-003 --from-quote 7 --quantity 2  # Create from an existing quote
 buylog po list                                       # List all purchase orders
 buylog po list --status pending                      # Filter by status
+buylog po list --vendor "Amazon"                     # Filter by vendor
+buylog po show PO-001                                # Show one purchase order
 buylog po update PO-001 --status ordered             # Update status
 buylog po update PO-001 --status received            # Mark as received
 
@@ -216,13 +226,73 @@ buylog po update PO-001 --status received            # Mark as received
 buylog spec create "Camera Spec" --description "For camera products"
 buylog spec add-feature "Camera Spec" "Resolution" --type number --unit "MP"
 buylog spec add-feature "Camera Spec" "Has WiFi" --type boolean
+buylog spec add-feature "Camera Spec" "Weight" --type number --unit g --required
 buylog spec list                                     # List all specifications
 buylog spec show "Camera Spec"                       # Show spec with features
+buylog spec delete "Camera Spec"                     # Delete a specification
+
+# Automation - check alerts and watchlist targets, then notify (designed for cron)
+buylog check                                         # Report what triggered
+buylog check --quiet                                 # Print nothing when idle
+buylog check --notify ntfy                           # Push a notification
+buylog check --refresh-fx --refresh-scrapes          # Refresh data first, then check
+
+# Forex rates
+buylog fx refresh                                    # Refresh every currency your vendors use
+buylog fx refresh EUR GBP                            # Refresh specific currencies
+buylog fx refresh --date 2026-08-31                  # Record under a specific date
+buylog fx list                                       # List stored rates
+
+# Re-scrape tracked product URLs
+buylog scrape refresh --list                         # Show quotes that carry a source URL
+buylog scrape refresh                                # Re-scrape them and record changes
+buylog scrape refresh --quote-id 3                   # Refresh one quote
+
+# Spend analytics (from purchase orders)
+buylog spend                                         # Everything below, plus totals
+buylog spend month                                   # Spend per calendar month
+buylog spend vendor                                  # Spend per vendor
+buylog spend category                                # Spend per product category
+buylog spend variance                                # Paid vs. best recorded price
+buylog spend --from 2026-01-01 --to 2026-06-30       # Restrict to a date range
 
 # Database migration
 buylog migrate                                       # Apply pending schema migrations
 buylog migrate --dry-run                             # Preview SQL without executing
 ```
+
+#### Running on a schedule
+
+`buylog check` is built for cron: it takes no interactive input, prints nothing
+when `--quiet` and nothing has triggered, and exits non-zero on failure.
+
+```cron
+# Refresh rates and prices, then notify, every morning at 08:00
+0 8 * * *  BUYLOG_NOTIFY=ntfy BUYLOG_NTFY_TOPIC=my-buylog \
+             buylog check --quiet --refresh-fx --refresh-scrapes
+```
+
+#### Notification channels
+
+Channels are selected with `BUYLOG_NOTIFY` (comma-separated) or `--notify`, and
+configured entirely by environment variable so a cron entry needs no arguments.
+
+| Channel   | Required                          | Optional |
+| --------- | --------------------------------- | -------- |
+| `stdout`  | -                                 | - |
+| `ntfy`    | `BUYLOG_NTFY_TOPIC`               | `BUYLOG_NTFY_SERVER`, `BUYLOG_NTFY_TOKEN` |
+| `webhook` | `BUYLOG_WEBHOOK_URL`              | - |
+| `desktop` | `notify-send`/`terminal-notifier`/`osascript` | - |
+| `email`   | `BUYLOG_SMTP_HOST`, `BUYLOG_EMAIL_TO` | `BUYLOG_SMTP_PORT`, `BUYLOG_SMTP_USER`, `BUYLOG_SMTP_PASSWORD`, `BUYLOG_SMTP_STARTTLS`, `BUYLOG_EMAIL_FROM` |
+
+A channel that is selected but not configured reports the variable it needs
+rather than failing silently.
+
+#### Exit codes
+
+The CLI is safe to script: `0` on success, `1` on a handled error, `130` on
+interrupt. Confirmation prompts never block on a non-interactive stdin - pass
+`--yes` to confirm automatically.
 
 ### Text User Interface (TUI)
 
@@ -297,9 +367,12 @@ uv run pytest --cov-report=html:cov_html --cov-report=term-missing --cov=buylog
 ```bash
 make diagram
 # or
-uv run python src/buylog/models.py
+uv run python scripts/gen_diagram.py
 
-# Output: doc/er_model.svg
+# Output: doc/er_model.md  (Mermaid, renders inline on GitHub)
+#         doc/er_model.er  (eralchemy markup)
+#         doc/er_model.dot (Graphviz source)
+#         doc/er_model.svg (only when Graphviz is installed)
 ```
 
 ### Clean Build Artifacts
@@ -323,17 +396,23 @@ buylog/
 │   ├── templates.py     # YAML/JSON template generation
 │   ├── migrate.py       # Database schema migration
 │   ├── config.py        # Configuration management
-│   ├── audit.py         # Audit logging
-│   └── cache.py         # Caching utilities
+│   ├── notify.py        # Notification delivery (ntfy/webhook/desktop/email)
+│   └── audit.py         # Audit logging
 ├── tests/               # Test suite
 │   ├── conftest.py      # pytest fixtures
-│   ├── factories.py     # Factory Boy test data
 │   ├── test_models.py   # Model tests
 │   ├── test_services.py # Service layer tests
+│   ├── test_schema.py   # Schema creation and migration tests
+│   ├── test_cli.py      # CLI end-to-end tests
+│   ├── test_tui.py      # TUI smoke tests
+│   ├── test_notify.py   # Notification channel tests
+│   ├── test_automation.py # check/fx refresh/scrape refresh/spend tests
 │   ├── test_excel.py    # Excel import/export tests
 │   └── test_quote_analysis.py # Quote analysis feature tests
 ├── doc/                 # Documentation
-│   └── er_model.svg     # Auto-generated ER diagram
+│   ├── er_model.md      # Auto-generated ER diagram (Mermaid)
+│   ├── er_model.er      # Auto-generated ER diagram (eralchemy)
+│   └── er_model.dot     # Auto-generated ER diagram (Graphviz)
 └── pyproject.toml       # Project dependencies
 ```
 
@@ -368,7 +447,7 @@ Key relationships:
 - Many-to-many between PurchaseList and Quotes (via `purchase_list_quote` junction table)
 - One-to-many from Product to Watchlist
 
-See the auto-generated ER diagram: `doc/er_model.svg`
+See the auto-generated ER diagram: [`doc/er_model.md`](doc/er_model.md)
 
 ### Service Layer
 
@@ -398,7 +477,6 @@ Business logic is separated into service classes:
 - **Textual** - Modern terminal UI framework
 - **openpyxl** - Excel file read/write
 - **pytest** - Testing framework
-- **Factory Boy** - Test data generation
 - **uv** - Fast Python package manager
 - **eralchemy** - ER diagram generation
 - **tabulate** - CLI table formatting
@@ -410,6 +488,9 @@ The application uses a configuration system via `config.py`:
 - Database path: `~/.buylog/buylog.db` (configurable via `BUYER_DB_PATH`)
 - Log level: `INFO` by default (configurable via `BUYER_LOG_LEVEL`)
 - Logging: Configured for both file and console output
+
+Notifications are configured separately, via the `BUYLOG_NOTIFY` and per-channel
+environment variables listed under [Notification channels](#notification-channels).
 
 ## License
 

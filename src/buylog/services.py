@@ -12,8 +12,9 @@ import io
 import json
 import logging
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Iterator
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
@@ -41,6 +42,7 @@ from .models import (
     PO_STATUSES,
     PO_STATUS_PENDING,
     PO_STATUS_RECEIVED,
+    PO_STATUS_CANCELLED,
 )
 from .audit import AuditService
 
@@ -69,6 +71,84 @@ class NotFoundError(ServiceError):
     """Raised when an entity is not found"""
 
     pass
+
+
+def _blocking_purchase_orders(session: Session, column: Any, value: Any) -> List[str]:
+    """
+    PO numbers that reference ``value`` through ``column``.
+
+    A purchase order is a record of money committed, so it is never deleted as
+    a side effect of tidying up a vendor, product or quote.
+    """
+    return [
+        po.po_number
+        for po in session.execute(select(PurchaseOrder).where(column == value))
+        .scalars()
+        .all()
+    ]
+
+
+def _refuse_if_referenced_by_purchase_orders(
+    session: Session, column: Any, value: Any, what: str
+) -> None:
+    """
+    Raise a clear error if purchase orders reference this entity.
+
+    Without this the delete still fails, but as a bare "FOREIGN KEY constraint
+    failed" that says nothing about which orders are in the way.
+    """
+    blocking = _blocking_purchase_orders(session, column, value)
+    if blocking:
+        raise ValidationError(
+            f"Cannot delete {what}: referenced by purchase order(s) "
+            f"{', '.join(sorted(blocking))}. Delete or reassign them first."
+        )
+
+
+@contextmanager
+def commit_or_rollback(
+    session: Session,
+    what: str,
+    duplicate_message: Optional[str] = None,
+) -> Iterator[None]:
+    """
+    Commit the session on success, roll back and translate errors on failure.
+
+    Wraps the ``try / commit / except IntegrityError / except SQLAlchemyError /
+    rollback / raise`` block that every write in this module needs, so the
+    rollback cannot be forgotten and the error mapping stays consistent.
+
+    Args:
+        session: Database session
+        what: Short description of the operation, used in log and error text
+              (e.g. ``"create brand 'Apple'"``)
+        duplicate_message: Message for the ``DuplicateError`` raised on an
+                           integrity violation. When omitted, an integrity
+                           violation is reported as a ``ServiceError``.
+
+    Raises:
+        DuplicateError: On an integrity violation, if ``duplicate_message`` is set
+        ServiceError: On any other database error
+    """
+    try:
+        yield
+        session.commit()
+    except IntegrityError as e:
+        session.rollback()
+        logger.error(f"Failed to {what}: {e}")
+        if duplicate_message:
+            raise DuplicateError(duplicate_message) from e
+        raise ServiceError(f"Failed to {what}: {e}") from e
+    except SQLAlchemyError as e:
+        session.rollback()
+        logger.error(f"Database error trying to {what}: {e}")
+        raise ServiceError(f"Failed to {what}: {e}") from e
+    except Exception:
+        # Any other failure inside the block would otherwise leave the caller's
+        # mutations pending on the session, to be committed by whatever writes
+        # next. Discard them and let the original exception through unchanged.
+        session.rollback()
+        raise
 
 
 class BrandService:
@@ -223,7 +303,11 @@ class BrandService:
     @staticmethod
     def delete(session: Session, name: str) -> None:
         """
-        Delete a brand.
+        Delete a brand that has no products.
+
+        A brand's products are independently meaningful records, and deleting
+        them would take their quotes and price history with them, so this
+        refuses rather than cascading.
 
         Args:
             session: Database session
@@ -231,26 +315,38 @@ class BrandService:
 
         Raises:
             NotFoundError: If brand not found
+            ValidationError: If the brand still has products
         """
         brand = Brand.by_name(session, name)
         if not brand:
             raise NotFoundError(f"Brand '{name}' not found")
 
-        try:
+        if brand.products:
+            names = sorted(p.name for p in brand.products)
+            shown = ", ".join(names[:5])
+            if len(names) > 5:
+                shown += f", and {len(names) - 5} more"
+            raise ValidationError(
+                f"Cannot delete brand '{name}': it still has "
+                f"{len(names)} product(s) ({shown}). Delete or reassign them first."
+            )
+
+        with commit_or_rollback(session, f"delete brand '{name}'"):
             session.delete(brand)
-            session.commit()
-            logger.info(f"Deleted brand: {name}")
-        except SQLAlchemyError as e:
-            session.rollback()
-            logger.error(f"Failed to delete brand '{name}': {e}")
-            raise ServiceError(f"Failed to delete brand: {e}") from e
+
+        logger.info(f"Deleted brand: {name}")
 
 
 class ProductService:
     """Service for product-related business logic"""
 
     @staticmethod
-    def create(session: Session, name: str, brand_name: str) -> Product:
+    def create(
+        session: Session,
+        name: str,
+        brand_name: str,
+        category: Optional[str] = None,
+    ) -> Product:
         """
         Create a new product under a brand.
 
@@ -258,6 +354,7 @@ class ProductService:
             session: Database session
             name: Product name
             brand_name: Brand name (will be created if doesn't exist)
+            category: Optional category, used by the spend-by-category report
 
         Returns:
             Created Product instance
@@ -288,20 +385,20 @@ class ProductService:
             raise DuplicateError(f"Product '{name}' already exists")
 
         # Create product
-        try:
-            product = Product(name=name, brand=brand)
+        product = Product(
+            name=name,
+            brand=brand,
+            category=category.strip() if category else None,
+        )
+        with commit_or_rollback(
+            session,
+            f"create product '{name}'",
+            duplicate_message=f"Product '{name}' already exists",
+        ):
             session.add(product)
-            session.commit()
-            logger.info(f"Created product: {name} under brand: {brand_name}")
-            return product
-        except IntegrityError as e:
-            session.rollback()
-            logger.error(f"Failed to create product '{name}': {e}")
-            raise DuplicateError(f"Product '{name}' already exists") from e
-        except SQLAlchemyError as e:
-            session.rollback()
-            logger.error(f"Database error creating product '{name}': {e}")
-            raise ServiceError(f"Failed to create product: {e}") from e
+
+        logger.info(f"Created product: {name} under brand: {brand_name}")
+        return product
 
     @staticmethod
     def get_by_name(session: Session, name: str) -> Optional[Product]:
@@ -335,6 +432,92 @@ class ProductService:
         query = query.limit(limit).offset(offset)
         results = session.execute(query).unique().scalars().all()
         return list(results)
+
+    @staticmethod
+    def update(
+        session: Session,
+        name: str,
+        new_name: Optional[str] = None,
+        brand_name: Optional[str] = None,
+        category: Optional[str] = None,
+    ) -> Product:
+        """
+        Update a product.
+
+        Args:
+            session: Database session
+            name: Current product name
+            new_name: Optional new product name
+            brand_name: Optional new brand name
+            category: Optional new category
+
+        Returns:
+            Updated Product instance
+
+        Raises:
+            NotFoundError: If the product or the new brand is not found
+            ValidationError: If the new name is invalid
+            DuplicateError: If the new name is already taken
+        """
+        product = Product.by_name(session, name)
+        if not product:
+            raise NotFoundError(f"Product '{name}' not found")
+
+        if new_name is not None:
+            new_name = new_name.strip()
+            if not new_name:
+                raise ValidationError("Product name cannot be empty")
+            if len(new_name) > 255:
+                raise ValidationError("Product name too long (max 255 characters)")
+            if new_name != name and Product.by_name(session, new_name):
+                raise DuplicateError(f"Product '{new_name}' already exists")
+
+        if brand_name is not None:
+            brand = Brand.by_name(session, brand_name)
+            if not brand:
+                raise NotFoundError(f"Brand '{brand_name}' not found")
+        else:
+            brand = None
+
+        with commit_or_rollback(
+            session,
+            f"update product '{name}'",
+            duplicate_message=f"Product '{new_name}' already exists",
+        ):
+            if new_name is not None:
+                product.name = new_name
+            if brand is not None:
+                product.brand = brand
+            if category is not None:
+                product.category = category
+
+        logger.info(f"Updated product '{name}'")
+        return product
+
+    @staticmethod
+    def delete(session: Session, name: str) -> None:
+        """
+        Delete a product and everything that hangs off it.
+
+        Args:
+            session: Database session
+            name: Product name
+
+        Raises:
+            NotFoundError: If product not found
+        """
+        product = Product.by_name(session, name)
+        if not product:
+            raise NotFoundError(f"Product '{name}' not found")
+
+        _refuse_if_referenced_by_purchase_orders(
+            session, PurchaseOrder.product_id, product.id, f"product '{name}'"
+        )
+
+        with commit_or_rollback(session, f"delete product '{name}'"):
+            session.delete(product)
+
+        logger.info(f"Deleted product: {name}")
 
 
 class VendorService:
@@ -462,6 +645,105 @@ class VendorService:
         results = session.execute(query).unique().scalars().all()
         return list(results)
 
+    @staticmethod
+    def update(
+        session: Session,
+        name: str,
+        new_name: Optional[str] = None,
+        currency: Optional[str] = None,
+        discount_code: Optional[str] = None,
+        discount: Optional[float] = None,
+        url: Optional[str] = None,
+    ) -> Vendor:
+        """
+        Update a vendor.
+
+        Note that changing ``currency`` does not re-convert existing quotes;
+        their stored USD values were normalized at the rate in force when they
+        were entered.
+
+        Args:
+            session: Database session
+            name: Current vendor name
+            new_name: Optional new vendor name
+            currency: Optional new currency code
+            discount_code: Optional new discount code
+            discount: Optional new discount percentage
+            url: Optional new vendor URL
+
+        Returns:
+            Updated Vendor instance
+
+        Raises:
+            NotFoundError: If vendor not found
+            ValidationError: If a new value is invalid
+            DuplicateError: If the new name is already taken
+        """
+        vendor = Vendor.by_name(session, name)
+        if not vendor:
+            raise NotFoundError(f"Vendor '{name}' not found")
+
+        if new_name is not None:
+            new_name = new_name.strip()
+            if not new_name:
+                raise ValidationError("Vendor name cannot be empty")
+            if len(new_name) > 255:
+                raise ValidationError("Vendor name too long (max 255 characters)")
+            if new_name != name and Vendor.by_name(session, new_name):
+                raise DuplicateError(f"Vendor '{new_name}' already exists")
+
+        if currency is not None:
+            currency = currency.strip().upper()
+            if len(currency) != 3:
+                raise ValidationError("Currency code must be 3 characters (ISO 4217)")
+
+        if discount is not None and not 0 <= discount <= 100:
+            raise ValidationError("Discount must be between 0 and 100")
+
+        with commit_or_rollback(
+            session,
+            f"update vendor '{name}'",
+            duplicate_message=f"Vendor '{new_name}' already exists",
+        ):
+            if new_name is not None:
+                vendor.name = new_name
+            if currency is not None:
+                vendor.currency = currency
+            if discount_code is not None:
+                vendor.discount_code = discount_code
+            if discount is not None:
+                vendor.discount = discount
+            if url is not None:
+                vendor.url = url
+
+        logger.info(f"Updated vendor '{name}'")
+        return vendor
+
+    @staticmethod
+    def delete(session: Session, name: str) -> None:
+        """
+        Delete a vendor and everything that hangs off it.
+
+        Args:
+            session: Database session
+            name: Vendor name
+
+        Raises:
+            NotFoundError: If vendor not found
+        """
+        vendor = Vendor.by_name(session, name)
+        if not vendor:
+            raise NotFoundError(f"Vendor '{name}' not found")
+
+        _refuse_if_referenced_by_purchase_orders(
+            session, PurchaseOrder.vendor_id, vendor.id, f"vendor '{name}'"
+        )
+
+        with commit_or_rollback(session, f"delete vendor '{name}'"):
+            session.delete(vendor)
+
+        logger.info(f"Deleted vendor: {name}")
+
 
 class QuoteService:
     """Service for quote-related business logic"""
@@ -473,6 +755,9 @@ class QuoteService:
         product_name: str,
         price: float,
         brand_name: Optional[str] = None,
+        shipping_cost: Optional[float] = None,
+        tax_rate: Optional[float] = None,
+        record_history: bool = True,
     ) -> Quote:
         """
         Create a new quote from a vendor for a product.
@@ -483,6 +768,9 @@ class QuoteService:
             product_name: Product name
             price: Price in vendor's currency
             brand_name: Optional brand name (for creating new products)
+            shipping_cost: Optional shipping cost, in the vendor's currency
+            tax_rate: Optional tax rate, as a percentage
+            record_history: Whether to write a "create" price-history entry
 
         Returns:
             Created Quote instance
@@ -494,6 +782,10 @@ class QuoteService:
         # Validate input
         if price < 0:
             raise ValidationError("Price cannot be negative")
+        if shipping_cost is not None and shipping_cost < 0:
+            raise ValidationError("Shipping cost cannot be negative")
+        if tax_rate is not None and tax_rate < 0:
+            raise ValidationError("Tax rate cannot be negative")
 
         # Get vendor
         vendor = Vendor.by_name(session, vendor_name)
@@ -509,48 +801,40 @@ class QuoteService:
                 )
             product = ProductService.create(session, product_name, brand_name)
 
-        # Convert currency if needed
-        value = price
-        original_value = None
-        original_currency = None
-
-        if vendor.currency != "USD":
-            fx_rate = session.execute(
-                select(Forex)
-                .where(Forex.code == vendor.currency)
-                .order_by(Forex.date.desc())
-            ).scalar_one_or_none()
-
-            if not fx_rate:
-                raise ValidationError(
-                    f"Forex rate for '{vendor.currency}' not found. "
-                    "Please add it using the add-fx command."
-                )
-
-            original_value = price
-            original_currency = vendor.currency
-            value = price * fx_rate.usd_per_unit
+        # Convert currency if needed. Shipping is quoted in the same currency
+        # as the price, so it has to be normalized too - otherwise total_cost
+        # adds e.g. EUR shipping onto a USD base.
+        value, original_value, original_currency = ForexService.to_usd(
+            session, price, vendor.currency
+        )
+        if shipping_cost is not None:
+            shipping_cost, _, _ = ForexService.to_usd(
+                session, shipping_cost, vendor.currency
+            )
 
         # Create quote
-        try:
-            quote = Quote(
-                vendor=vendor,
-                product=product,
-                currency="USD",
-                value=value,
-                original_value=original_value,
-                original_currency=original_currency,
-            )
+        quote = Quote(
+            vendor=vendor,
+            product=product,
+            currency="USD",
+            value=value,
+            original_value=original_value,
+            original_currency=original_currency,
+            shipping_cost=shipping_cost,
+            tax_rate=tax_rate,
+        )
+        with commit_or_rollback(
+            session, f"create quote for '{product_name}' from '{vendor_name}'"
+        ):
             session.add(quote)
-            session.commit()
-            logger.info(
-                f"Created quote: {vendor_name} -> {product_name} = {price} {vendor.currency}"
-            )
-            return quote
-        except SQLAlchemyError as e:
-            session.rollback()
-            logger.error(f"Database error creating quote: {e}")
-            raise ServiceError(f"Failed to create quote: {e}") from e
+
+        if record_history:
+            QuoteHistoryService.record_change(session, quote, None, value, "create")
+
+        logger.info(
+            f"Created quote: {vendor_name} -> {product_name} = {price} {vendor.currency}"
+        )
+        return quote
 
     @staticmethod
     def get_all(
@@ -748,6 +1032,148 @@ class QuoteService:
         )
         return list(results)
 
+    @staticmethod
+    def get_by_id(session: Session, quote_id: int) -> Optional[Quote]:
+        """Get a quote by ID, with vendor, product and brand eagerly loaded."""
+        return (
+            session.execute(
+                select(Quote)
+                .options(
+                    joinedload(Quote.vendor),
+                    joinedload(Quote.product).joinedload(Product.brand),
+                )
+                .where(Quote.id == quote_id)
+            )
+            .unique()
+            .scalar_one_or_none()
+        )
+
+    @staticmethod
+    def update(
+        session: Session,
+        quote_id: int,
+        price: Optional[float] = None,
+        shipping_cost: Optional[float] = None,
+        tax_rate: Optional[float] = None,
+        discount: Optional[float] = None,
+        status: Optional[str] = None,
+        price_currency: Optional[str] = None,
+    ) -> Quote:
+        """
+        Update a quote.
+
+        A ``price`` is normalized to USD the same way ``create`` does, and the
+        change is recorded in the quote's price history.
+
+        Args:
+            session: Database session
+            quote_id: Quote ID
+            price: Optional new price
+            shipping_cost: Optional new shipping cost, in the same currency
+                           as ``price``
+            tax_rate: Optional new tax rate, as a percentage
+            discount: Optional new discount, as a percentage
+            status: Optional new status
+            price_currency: Currency of ``price`` (default: vendor's currency).
+                            A re-scraped page may quote a different currency
+                            than the vendor's default.
+
+        Returns:
+            Updated Quote instance
+
+        Raises:
+            NotFoundError: If quote not found
+            ValidationError: If a new value is invalid
+        """
+        quote = session.get(Quote, quote_id)
+        if not quote:
+            raise NotFoundError(f"Quote with ID {quote_id} not found")
+
+        if price is not None and price < 0:
+            raise ValidationError("Price cannot be negative")
+        if shipping_cost is not None and shipping_cost < 0:
+            raise ValidationError("Shipping cost cannot be negative")
+        if tax_rate is not None and tax_rate < 0:
+            raise ValidationError("Tax rate cannot be negative")
+        if discount is not None and not 0 <= discount <= 100:
+            raise ValidationError("Discount must be between 0 and 100")
+        if status is not None:
+            status = status.lower()
+            if status not in QUOTE_STATUSES:
+                raise ValidationError(
+                    f"Invalid status '{status}'. "
+                    f"Must be one of: {', '.join(QUOTE_STATUSES)}"
+                )
+
+        old_value = quote.value
+        new_value = old_value
+        original_value: Optional[float] = quote.original_value
+        original_currency: Optional[str] = quote.original_currency
+        if price is not None:
+            new_value, original_value, original_currency = ForexService.to_usd(
+                session, price, price_currency or quote.vendor.currency
+            )
+
+        if shipping_cost is not None:
+            shipping_cost, _, _ = ForexService.to_usd(
+                session, shipping_cost, price_currency or quote.vendor.currency
+            )
+
+        with commit_or_rollback(session, f"update quote {quote_id}"):
+            if price is not None:
+                quote.value = new_value
+                quote.original_value = original_value
+                quote.original_currency = original_currency
+            if shipping_cost is not None:
+                quote.shipping_cost = shipping_cost
+            if tax_rate is not None:
+                quote.tax_rate = tax_rate
+            if discount is not None:
+                quote.discount = discount
+            if status is not None:
+                quote.status = status
+
+        if price is not None and new_value != old_value:
+            QuoteHistoryService.record_change(
+                session, quote, old_value, new_value, "update"
+            )
+
+        logger.info(f"Updated quote {quote_id}")
+        return quote
+
+    @staticmethod
+    def delete(session: Session, quote_id: int) -> None:
+        """
+        Delete a quote and its price history.
+
+        Args:
+            session: Database session
+            quote_id: Quote ID
+
+        Raises:
+            NotFoundError: If quote not found
+        """
+        quote = session.get(Quote, quote_id)
+        if not quote:
+            raise NotFoundError(f"Quote with ID {quote_id} not found")
+
+        with commit_or_rollback(session, f"delete quote {quote_id}"):
+            # A purchase order's link back to the quote it came from is
+            # optional, so detach rather than block the delete - the order
+            # keeps its own recorded prices.
+            for po in (
+                session.execute(
+                    select(PurchaseOrder).where(PurchaseOrder.quote_id == quote_id)
+                )
+                .scalars()
+                .all()
+            ):
+                po.quote_id = None
+            session.flush()
+            session.delete(quote)
+
+        logger.info(f"Deleted quote {quote_id}")
+
 
 class ForexService:
     """Service for forex rate management"""
@@ -832,6 +1258,41 @@ class ForexService:
             .order_by(Forex.date.desc())
             .limit(1)
         ).scalar_one_or_none()
+
+    @staticmethod
+    def to_usd(
+        session: Session, amount: float, currency: Optional[str]
+    ) -> tuple[float, Optional[float], Optional[str]]:
+        """
+        Normalize an amount to USD using the most recent rate on file.
+
+        This is the single place currency normalization happens; the CLI, the
+        TUI, quote creation and import all route through it so they cannot
+        drift apart.
+
+        Args:
+            session: Database session
+            amount: Amount in ``currency``
+            currency: ISO 4217 code of ``amount`` (``None`` is treated as USD)
+
+        Returns:
+            ``(usd_value, original_value, original_currency)``. The original
+            pair is ``(None, None)`` when the amount was already in USD.
+
+        Raises:
+            ValidationError: If no rate is on file for ``currency``
+        """
+        code = (currency or "USD").strip().upper()
+        if code == "USD":
+            return amount, None, None
+
+        rate = ForexService.get_latest(session, code)
+        if rate is None:
+            raise ValidationError(
+                f"Forex rate for '{code}' not found. "
+                "Please add it using the add-fx command."
+            )
+        return amount * rate.usd_per_unit, amount, code
 
 
 class QuoteHistoryService:
@@ -1033,12 +1494,28 @@ class PriceAlertService:
 
         triggered = []
         for alert in alerts:
-            if current_price <= alert.threshold_value:
+            # current_price is USD, so a non-USD threshold has to be converted
+            # before comparison - it used to be compared as if it were USD.
+            try:
+                threshold_usd, _, _ = ForexService.to_usd(
+                    session, alert.threshold_value, alert.threshold_currency
+                )
+            except ValidationError:
+                logger.warning(
+                    f"Skipping alert {alert.id} for product {product.name}: "
+                    f"no forex rate for threshold currency "
+                    f"'{alert.threshold_currency}'"
+                )
+                continue
+
+            if current_price <= threshold_usd:
                 alert.triggered_at = datetime.datetime.now()
                 triggered.append(alert)
                 logger.info(
                     f"Alert triggered for product {product.name}: "
-                    f"price {current_price} <= threshold {alert.threshold_value}"
+                    f"price {current_price} USD <= threshold "
+                    f"{alert.threshold_value} {alert.threshold_currency} "
+                    f"({threshold_usd} USD)"
                 )
 
         if triggered:
@@ -1602,7 +2079,7 @@ class PurchaseOrderService:
         product_name: str,
         unit_price: float,
         quantity: int = 1,
-        currency: str = "USD",
+        currency: Optional[str] = None,
         quote_id: Optional[int] = None,
         order_date: Optional[datetime.date] = None,
         expected_delivery: Optional[datetime.date] = None,
@@ -1620,9 +2097,9 @@ class PurchaseOrderService:
             po_number: Unique PO number
             vendor_name: Vendor name
             product_name: Product name
-            unit_price: Price per unit
+            unit_price: Price per unit, in ``currency``
             quantity: Number of units (default: 1)
-            currency: Currency code (default: USD)
+            currency: Currency code (defaults to the vendor's currency)
             quote_id: Optional associated quote ID
             order_date: Optional order date
             expected_delivery: Optional expected delivery date
@@ -1673,9 +2150,14 @@ class PurchaseOrderService:
         if existing:
             raise DuplicateError(f"PO number '{po_number}' already exists")
 
+        # An order is priced in the vendor's currency unless told otherwise;
+        # defaulting to USD used to label a EUR vendor's prices as USD.
+        currency = (currency or vendor.currency or "USD").strip().upper()
+
         # Compute totals
         total_amount = unit_price * quantity
         grand_total = total_amount + (shipping_cost or 0.0) + (tax or 0.0)
+        grand_total_usd, _, _ = ForexService.to_usd(session, grand_total, currency)
 
         try:
             po = PurchaseOrder(
@@ -1685,11 +2167,12 @@ class PurchaseOrderService:
                 quote_id=quote_id,
                 unit_price=unit_price,
                 quantity=quantity,
-                currency=currency.upper(),
+                currency=currency,
                 total_amount=total_amount,
                 shipping_cost=shipping_cost,
                 tax=tax,
                 grand_total=grand_total,
+                grand_total_usd=grand_total_usd,
                 order_date=order_date,
                 expected_delivery=expected_delivery,
                 invoice_number=invoice_number,
@@ -2825,21 +3308,25 @@ class ImportService:
         shipping = float(shipping_str) if shipping_str else None
         tax_rate = float(tax_rate_str) if tax_rate_str else None
 
-        # Get or create vendor
-        vendor = Vendor.by_name(session, vendor_name)
-        if not vendor:
-            if create_missing:
+        # A row that fails part-way through must not leave a half-created vendor
+        # or product pending in the session for the next successful row to
+        # commit, so roll back this row's own work before re-raising.
+        try:
+            # Get or create vendor
+            vendor = Vendor.by_name(session, vendor_name)
+            if not vendor:
+                if not create_missing:
+                    raise NotFoundError(f"Vendor not found: {vendor_name}")
                 vendor = Vendor(name=vendor_name, currency=currency)
                 session.add(vendor)
                 session.flush()
                 result["created_vendor"] = vendor_name
-            else:
-                raise NotFoundError(f"Vendor not found: {vendor_name}")
 
-        # Get or create product
-        product = Product.by_name(session, product_name)
-        if not product:
-            if create_missing:
+            # Get or create product
+            product = Product.by_name(session, product_name)
+            if not product:
+                if not create_missing:
+                    raise NotFoundError(f"Product not found: {product_name}")
                 if not brand_name:
                     raise ValidationError(
                         f"Brand required for new product: {product_name}"
@@ -2853,38 +3340,31 @@ class ImportService:
                 session.add(product)
                 session.flush()
                 result["created_product"] = product_name
-            else:
-                raise NotFoundError(f"Product not found: {product_name}")
 
-        # Convert currency if needed
-        value = price
-        original_value = None
-        original_currency = None
+            # Normalize to USD. A missing rate is an error, matching
+            # QuoteService.create - storing a foreign price labelled "USD"
+            # silently corrupts every later comparison.
+            value, original_value, original_currency = ForexService.to_usd(
+                session, price, vendor.currency
+            )
+            if shipping is not None:
+                shipping, _, _ = ForexService.to_usd(session, shipping, vendor.currency)
 
-        if vendor.currency != "USD":
-            fx_rate = session.execute(
-                select(Forex)
-                .where(Forex.code == vendor.currency)
-                .order_by(Forex.date.desc())
-            ).scalar_one_or_none()
+            quote = Quote(
+                vendor=vendor,
+                product=product,
+                currency="USD",
+                value=value,
+                original_value=original_value,
+                original_currency=original_currency,
+                shipping_cost=shipping,
+                tax_rate=tax_rate,
+            )
+            session.add(quote)
+        except Exception:
+            session.rollback()
+            raise
 
-            if fx_rate:
-                original_value = price
-                original_currency = vendor.currency
-                value = price * fx_rate.usd_per_unit
-
-        # Create quote
-        quote = Quote(
-            vendor=vendor,
-            product=product,
-            currency="USD",
-            value=value,
-            original_value=original_value,
-            original_currency=original_currency,
-            shipping_cost=shipping,
-            tax_rate=tax_rate,
-        )
-        session.add(quote)
         session.commit()
         result["imported"] = True
         return result
@@ -3003,6 +3483,8 @@ class ExportService:
                 "price",
                 "total_cost",
                 "currency",
+                "original_price",
+                "original_currency",
                 "shipping",
                 "tax_rate",
                 "status",
@@ -3021,6 +3503,8 @@ class ExportService:
                     f"{q.value:.2f}",
                     f"{q.total_cost:.2f}",
                     q.currency,
+                    f"{q.original_value:.2f}" if q.original_value is not None else "",
+                    q.original_currency or "",
                     f"{q.shipping_cost:.2f}" if q.shipping_cost else "",
                     f"{q.tax_rate:.2f}" if q.tax_rate else "",
                     q.status or "",
@@ -3877,11 +4361,13 @@ class ScraperService:
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        result = {
+        result: Dict[str, Any] = {
             "url": url,
             "title": None,
             "price": None,
-            "currency": "USD",
+            # None means the page did not state a currency; callers fall back
+            # to the vendor's.
+            "currency": None,
             "raw_price": None,
         }
 
@@ -3894,7 +4380,7 @@ class ScraperService:
         price = ScraperService._extract_price(soup)
         if price:
             result["price"] = price["value"]
-            result["currency"] = price.get("currency", "USD")
+            result["currency"] = price.get("currency")
             result["raw_price"] = price.get("raw")
 
         logger.info(f"Scraped price from {url}: {result}")
@@ -3910,7 +4396,7 @@ class ScraperService:
         import re
 
         # Common price selectors to try
-        price_selectors = [
+        price_selectors: list[Dict[str, Any]] = [
             # JSON-LD structured data
             {"type": "json-ld"},
             # Meta tags
@@ -3941,18 +4427,34 @@ class ScraperService:
             except (json.JSONDecodeError, TypeError):
                 continue
 
-        # Try meta tags
+        # Try meta tags. Each price meta tag has a companion currency tag;
+        # assuming USD instead of reading it records foreign prices as USD.
+        currency_properties = {
+            "product:price:amount": "product:price:currency",
+            "og:price:amount": "og:price:currency",
+        }
         for selector in price_selectors[1:3]:
             tag = soup.find(**selector)
             if tag and tag.get("content"):
                 try:
-                    return {
-                        "value": float(tag["content"]),
-                        "currency": "USD",
-                        "raw": tag["content"],
-                    }
+                    value = float(tag["content"])
                 except ValueError:
                     continue
+                attrs = selector.get("attrs") or {}
+                currency_property = currency_properties.get(str(attrs.get("property")))
+                currency_tag = (
+                    soup.find("meta", attrs={"property": currency_property})
+                    if currency_property
+                    else None
+                )
+                currency = None
+                if currency_tag and currency_tag.get("content"):
+                    currency = str(currency_tag["content"]).strip().upper() or None
+                return {
+                    "value": value,
+                    "currency": currency,
+                    "raw": tag["content"],
+                }
 
         # Try common class patterns
         price_pattern = re.compile(r"\$?\d+(?:,\d{3})*(?:\.\d{2})?")
@@ -3968,11 +4470,16 @@ class ScraperService:
                     clean = re.sub(r"[\$\£\?,]", "", raw)
                     try:
                         value = float(clean)
-                        currency = "USD"
+                        # None means "the page did not say", so the caller can
+                        # fall back to the vendor's currency rather than
+                        # silently recording a foreign price as USD.
+                        currency = None
                         if "\u00a3" in text or "GBP" in text:
                             currency = "GBP"
                         elif "\u20ac" in text or "EUR" in text:
                             currency = "EUR"
+                        elif "$" in text or "USD" in text:
+                            currency = "USD"
                         return {"value": value, "currency": currency, "raw": raw}
                     except ValueError:
                         continue
@@ -3992,7 +4499,7 @@ class ScraperService:
                 try:
                     return {
                         "value": float(price),
-                        "currency": offers.get("priceCurrency", "USD"),
+                        "currency": offers.get("priceCurrency"),
                         "raw": str(price),
                     }
                 except ValueError:
@@ -4005,7 +4512,7 @@ class ScraperService:
                 try:
                     return {
                         "value": float(price),
-                        "currency": data.get("priceCurrency", "USD"),
+                        "currency": data.get("priceCurrency"),
                         "raw": str(price),
                     }
                 except ValueError:
@@ -4047,14 +4554,21 @@ class ScraperService:
         if not vendor:
             raise NotFoundError(f"Vendor '{vendor_name}' not found")
 
-        # Set vendor URL if not already set
+        # The page's own currency wins over the vendor's default: a vendor set
+        # up as USD can still list a GBP price, and recording it as USD would
+        # corrupt every comparison against it.
+        source_currency = (scraped.get("currency") or vendor.currency or "USD").upper()
+
+        # Work out the vendor's base URL, but do not assign it yet: mutating
+        # the vendor here would leave a dirty session behind if the quote is
+        # then rejected, or get committed as a side effect of creating the
+        # product below.
+        vendor_base_url = None
         if not vendor.url:
-            # Extract base URL
             from urllib.parse import urlparse
 
             parsed = urlparse(url)
-            base_url = f"{parsed.scheme}://{parsed.netloc}"
-            vendor.url = base_url
+            vendor_base_url = f"{parsed.scheme}://{parsed.netloc}"
 
         # Get or create product
         product = Product.by_name(session, product_name)
@@ -4065,22 +4579,28 @@ class ScraperService:
                 )
             product = ProductService.create(session, product_name, brand_name)
 
+        # Normalize to USD, keeping the scraped value and its currency
+        value, original_value, original_currency = ForexService.to_usd(
+            session, price, source_currency
+        )
+
         # Create quote
-        try:
-            quote = Quote(
-                vendor=vendor,
-                product=product,
-                currency="USD",  # Prices are stored in USD
-                value=price,
-            )
+        quote = Quote(
+            vendor=vendor,
+            product=product,
+            currency="USD",  # Prices are stored in USD
+            value=value,
+            original_value=original_value,
+            original_currency=original_currency,
+            source_url=url,
+        )
+        with commit_or_rollback(session, f"create quote from scraped URL {url}"):
+            if vendor_base_url:
+                vendor.url = vendor_base_url
             session.add(quote)
-            session.commit()
-            logger.info(f"Created quote from scraped URL: {url}")
-            return quote
-        except SQLAlchemyError as e:
-            session.rollback()
-            logger.error(f"Failed to create quote from scrape: {e}")
-            raise ServiceError(f"Failed to create quote: {e}") from e
+
+        logger.info(f"Created quote from scraped URL: {url}")
+        return quote
 
 
 class ReportService:
@@ -4323,6 +4843,7 @@ class ReportService:
             headers = [
                 "Vendor",
                 "Price (USD)",
+                "As Entered",
                 "Total Cost",
                 "Discount Code",
                 "Savings vs Worst",
@@ -4345,6 +4866,7 @@ class ReportService:
                     [
                         ReportService._escape_html(q.vendor.name),
                         f"${q.value:.2f}",
+                        ReportService._escape_html(q.source_price),
                         f"${q.total_cost:.2f}",
                         discount_code or "-",
                         savings or "-",
@@ -4578,6 +5100,107 @@ class ReportService:
         return html
 
     @staticmethod
+    def spend_analysis_report(
+        session: Session,
+        start: Optional[datetime.date] = None,
+        end: Optional[datetime.date] = None,
+    ) -> str:
+        """
+        Report on money actually committed, from purchase orders.
+
+        Args:
+            session: Database session
+            start: Optional start date
+            end: Optional end date
+
+        Returns:
+            Self-contained HTML string
+        """
+        totals = SpendAnalyticsService.summary(session, start, end)
+
+        html = ReportService._html_header("Spend Analysis")
+        html += f"""
+    <div class="summary">
+        <div class="summary-item">
+            <div class="summary-label">Purchase Orders</div>
+            <div class="summary-value">{totals["orders"]}</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">Total Spend (USD)</div>
+            <div class="summary-value">${totals["total"]:,.2f}</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">Average Order</div>
+            <div class="summary-value">${totals["average"]:,.2f}</div>
+        </div>
+    </div>
+"""
+
+        if not totals["orders"]:
+            html += "<p class='text-muted'>No purchase orders in this period.</p>\n"
+            return html + ReportService._html_footer()
+
+        html += "<h2>By month</h2>\n"
+        html += ReportService._html_table(
+            ["Month", "Orders", "Total (USD)"],
+            [
+                [row["period"], str(row["orders"]), f"${row['total']:,.2f}"]
+                for row in totals["by_month"]
+            ],
+        )
+
+        html += "<h2>By vendor</h2>\n"
+        html += ReportService._html_table(
+            ["Vendor", "Orders", "Total (USD)"],
+            [
+                [
+                    ReportService._escape_html(row["vendor"]),
+                    str(row["orders"]),
+                    f"${row['total']:,.2f}",
+                ]
+                for row in totals["by_vendor"]
+            ],
+        )
+
+        html += "<h2>By category</h2>\n"
+        html += ReportService._html_table(
+            ["Category", "Orders", "Total (USD)"],
+            [
+                [
+                    ReportService._escape_html(row["category"]),
+                    str(row["orders"]),
+                    f"${row['total']:,.2f}",
+                ]
+                for row in totals["by_category"]
+            ],
+        )
+
+        if totals["variance"]:
+            html += "<h2>Paid vs. best recorded price</h2>\n"
+            html += (
+                "<p class='text-muted'>A positive delta means the order cost more "
+                "than the cheapest quote on file for that product.</p>\n"
+            )
+            html += ReportService._html_table(
+                ["PO", "Product", "Vendor", "Unit Paid", "Best Recorded", "Delta"],
+                [
+                    [
+                        ReportService._escape_html(row["po_number"]),
+                        ReportService._escape_html(row["product"]),
+                        ReportService._escape_html(row["vendor"]),
+                        f"${row['unit_paid']:,.2f}",
+                        f"${row['best_price']:,.2f} "
+                        f"({ReportService._escape_html(row['best_vendor'])})",
+                        f"{row['delta']:+,.2f} ({row['delta_pct']:+.1f}%)",
+                    ]
+                    for row in totals["variance"]
+                ],
+                ["savings" if row["delta"] <= 0 else "" for row in totals["variance"]],
+            )
+
+        return html + ReportService._html_footer()
+
+    @staticmethod
     def generate_report(
         session: Session, preset: str, output_file: Optional[str] = None, **kwargs
     ) -> str:
@@ -4593,7 +5216,11 @@ class ReportService:
         Returns:
             HTML string (or file path if output_file specified)
         """
-        if preset == "price-comparison":
+        if preset == "spend-analysis":
+            html = ReportService.spend_analysis_report(
+                session, start=kwargs.get("start"), end=kwargs.get("end")
+            )
+        elif preset == "price-comparison":
             html = ReportService.price_comparison_report(
                 session, filter_term=kwargs.get("filter_term")
             )
@@ -4603,8 +5230,8 @@ class ReportService:
             html = ReportService.vendor_analysis_report(session)
         else:
             raise ValidationError(
-                f"Unknown report preset: {preset}. "
-                "Valid options: price-comparison, purchase-summary, vendor-analysis"
+                f"Unknown report preset: {preset}. Valid options: "
+                "price-comparison, purchase-summary, vendor-analysis, spend-analysis"
             )
 
         if output_file:
@@ -4614,3 +5241,511 @@ class ReportService:
             return str(output_path)
 
         return html
+
+
+class ScrapeRefreshService:
+    """
+    Re-fetch prices for quotes that record where they came from.
+
+    Quotes created by ``buylog scrape quote`` remember their ``source_url``.
+    Re-scraping them on a schedule keeps price history, trends, sparklines and
+    alerts current without any manual data entry.
+    """
+
+    @staticmethod
+    def tracked_quotes(session: Session) -> List[Quote]:
+        """Every quote that carries a source URL."""
+        return list(
+            session.execute(
+                select(Quote)
+                .options(
+                    joinedload(Quote.vendor),
+                    joinedload(Quote.product).joinedload(Product.brand),
+                )
+                .where(Quote.source_url.is_not(None))
+                .order_by(Quote.id)
+            )
+            .unique()
+            .scalars()
+            .all()
+        )
+
+    @staticmethod
+    def refresh(
+        session: Session, quote_ids: Optional[List[int]] = None
+    ) -> Dict[str, Any]:
+        """
+        Re-scrape tracked quotes and record any price change.
+
+        A quote whose page is unreachable or whose price cannot be parsed is
+        reported in ``errors`` and left untouched, so one dead link does not
+        stop the rest.
+
+        Args:
+            session: Database session
+            quote_ids: Only refresh these quote IDs; None refreshes all tracked
+
+        Returns:
+            Dict with ``checked``, ``changed`` (list of change dicts),
+            ``unchanged`` and ``errors``
+        """
+        quotes = ScrapeRefreshService.tracked_quotes(session)
+        if quote_ids:
+            wanted = set(quote_ids)
+            quotes = [q for q in quotes if q.id in wanted]
+
+        changed: List[Dict[str, Any]] = []
+        unchanged = 0
+        errors: List[str] = []
+
+        for quote in quotes:
+            url = quote.source_url
+            if not url:  # pragma: no cover - filtered by the query above
+                continue
+            try:
+                scraped = ScraperService.scrape_price(url)
+            except ServiceError as e:
+                errors.append(f"Quote {quote.id} ({url}): {e}")
+                continue
+
+            price = scraped.get("price")
+            if price is None:
+                errors.append(f"Quote {quote.id} ({url}): no price found")
+                continue
+
+            currency = (
+                scraped.get("currency") or quote.original_currency or "USD"
+            ).upper()
+            try:
+                new_value, _, _ = ForexService.to_usd(session, float(price), currency)
+            except ValidationError as e:
+                errors.append(f"Quote {quote.id} ({url}): {e}")
+                continue
+
+            old_value = quote.value
+            if new_value == old_value:
+                unchanged += 1
+                continue
+
+            # update() normalizes and records the price-history entry, which is
+            # what drives trends and alerts.
+            QuoteService.update(
+                session, quote.id, price=float(price), price_currency=currency
+            )
+            changed.append(
+                {
+                    "quote_id": quote.id,
+                    "product": quote.product.name,
+                    "vendor": quote.vendor.name,
+                    "old_value": old_value,
+                    "new_value": new_value,
+                    "url": url,
+                }
+            )
+
+        logger.info(
+            f"Scrape refresh: checked {len(quotes)}, changed {len(changed)}, "
+            f"errors {len(errors)}"
+        )
+        return {
+            "checked": len(quotes),
+            "changed": changed,
+            "unchanged": unchanged,
+            "errors": errors,
+        }
+
+
+class ForexRefreshService:
+    """Fetch current forex rates from a public API."""
+
+    #: Frankfurter is free, needs no API key, and serves ECB reference rates.
+    API_URL = "https://api.frankfurter.dev/v1/latest"
+
+    @staticmethod
+    def fetch_rates(
+        codes: Optional[List[str]] = None, api_url: Optional[str] = None
+    ) -> Dict[str, float]:
+        """
+        Fetch USD-per-unit rates for the given currencies.
+
+        Args:
+            codes: Currency codes to fetch; None fetches every currency offered
+            api_url: Override the API endpoint (used by tests)
+
+        Returns:
+            Dict mapping currency code to USD per unit
+
+        Raises:
+            ServiceError: If the API is unreachable or returns an unusable body
+        """
+        import requests
+
+        wanted = [c.strip().upper() for c in (codes or []) if c.strip()]
+        # The API quotes "how much of X is one base unit", so basing on USD
+        # gives units-per-USD; the reciprocal is the usd_per_unit we store.
+        params: Dict[str, str] = {"base": "USD"}
+        if wanted:
+            params["symbols"] = ",".join(sorted(set(wanted) - {"USD"}))
+            if params["symbols"] == "":
+                return {}
+
+        try:
+            response = requests.get(
+                api_url or ForexRefreshService.API_URL, params=params, timeout=30
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as e:
+            raise ServiceError(f"Failed to fetch forex rates: {e}") from e
+        except ValueError as e:
+            raise ServiceError(f"Forex API returned invalid JSON: {e}") from e
+
+        rates = payload.get("rates")
+        if not isinstance(rates, dict) or not rates:
+            raise ServiceError("Forex API returned no rates")
+
+        converted: Dict[str, float] = {}
+        for code, units_per_usd in rates.items():
+            try:
+                units = float(units_per_usd)
+            except (TypeError, ValueError):
+                logger.warning(f"Ignoring unusable rate for {code}: {units_per_usd!r}")
+                continue
+            if units <= 0:
+                logger.warning(f"Ignoring non-positive rate for {code}: {units}")
+                continue
+            converted[code.upper()] = 1.0 / units
+
+        return converted
+
+    @staticmethod
+    def refresh(
+        session: Session,
+        codes: Optional[List[str]] = None,
+        date: Optional[datetime.date] = None,
+        api_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Fetch rates and store them for a date.
+
+        With no ``codes``, refreshes every currency already used by a vendor,
+        so a user's own set of currencies stays current without listing them.
+
+        Args:
+            session: Database session
+            codes: Currency codes to refresh
+            date: Date to record the rates under (default: today)
+            api_url: Override the API endpoint (used by tests)
+
+        Returns:
+            Dict with ``updated``, ``skipped`` and ``rates`` keys
+        """
+        date = date or datetime.date.today()
+
+        if not codes:
+            codes = [
+                row
+                for row in session.execute(select(Vendor.currency).distinct()).scalars()
+                if row and row.upper() != "USD"
+            ]
+            if not codes:
+                logger.info("No non-USD vendor currencies to refresh")
+                return {"updated": [], "skipped": [], "rates": {}}
+
+        rates = ForexRefreshService.fetch_rates(codes, api_url=api_url)
+
+        updated: List[str] = []
+        skipped: List[str] = []
+        for code in sorted({c.strip().upper() for c in codes if c.strip()}):
+            if code == "USD":
+                continue
+            if code not in rates:
+                logger.warning(f"Forex API did not return a rate for {code}")
+                skipped.append(code)
+                continue
+            try:
+                ForexService.create(session, code, rates[code], date=date)
+                updated.append(code)
+            except DuplicateError:
+                # A rate for this code and date is already on file.
+                skipped.append(code)
+
+        logger.info(
+            f"Forex refresh for {date}: updated {len(updated)}, skipped {len(skipped)}"
+        )
+        return {"updated": updated, "skipped": skipped, "rates": rates}
+
+
+class MonitorService:
+    """
+    Check tracked prices and report what needs attention.
+
+    This is the engine behind ``buylog check``: it evaluates price alerts and
+    watchlist targets against current best prices and returns everything that
+    fired, so the caller can notify the user without opening the app.
+    """
+
+    @staticmethod
+    def check(session: Session) -> Dict[str, Any]:
+        """
+        Evaluate alerts and watchlist targets against current best prices.
+
+        Returns:
+            Dict with ``alerts`` (newly triggered PriceAlerts, each paired with
+            the quote that triggered it) and ``watchlist`` (entries whose target
+            price is met), plus a ``messages`` list of human-readable lines.
+        """
+        best_prices = QuoteService.get_best_prices_by_product(session)
+
+        triggered_alerts: List[Dict[str, Any]] = []
+        for product_id, quote in best_prices.items():
+            product = session.get(Product, product_id)
+            if product is None:
+                continue
+            for alert in PriceAlertService.check_alerts(session, product, quote.value):
+                triggered_alerts.append({"alert": alert, "quote": quote})
+
+        met_targets: List[Dict[str, Any]] = []
+        for entry in WatchlistService.get_active(session):
+            if entry.target_price is None:
+                continue
+            best = best_prices.get(entry.product_id)
+            if best is not None and best.value <= entry.target_price:
+                met_targets.append({"watchlist": entry, "quote": best})
+
+        messages: List[str] = []
+        for item in triggered_alerts:
+            alert, quote = item["alert"], item["quote"]
+            messages.append(
+                f"Alert: {quote.product.name} is ${quote.value:.2f} at "
+                f"{quote.vendor.name} (threshold "
+                f"{alert.threshold_value:.2f} {alert.threshold_currency})"
+            )
+        for item in met_targets:
+            entry, quote = item["watchlist"], item["quote"]
+            messages.append(
+                f"Watchlist: {quote.product.name} is ${quote.value:.2f} at "
+                f"{quote.vendor.name} (target ${entry.target_price:.2f})"
+            )
+
+        return {
+            "alerts": triggered_alerts,
+            "watchlist": met_targets,
+            "messages": messages,
+        }
+
+
+class SpendAnalyticsService:
+    """
+    Report on money actually committed, from purchase orders.
+
+    Quotes record what things cost; purchase orders record what was bought.
+    These reports answer "what did I spend, where, and did I buy well".
+    """
+
+    @staticmethod
+    def _po_total(po: PurchaseOrder) -> float:
+        """A purchase order's grand total in USD."""
+        if po.grand_total_usd is not None:
+            return po.grand_total_usd
+        # Orders written before grand_total_usd existed.
+        return po.grand_total
+
+    #: Statuses excluded from spend by default - money that was never committed.
+    EXCLUDED_STATUSES = (PO_STATUS_CANCELLED,)
+
+    @staticmethod
+    def _effective_date(po: PurchaseOrder) -> Optional[datetime.date]:
+        """
+        The date an order counts against.
+
+        ``order_date`` is optional, so fall back to when the record was
+        created. Filtering on the raw column instead would silently drop
+        undated orders from every date-bounded report while still counting
+        them in the unbounded one.
+        """
+        if po.order_date:
+            return po.order_date
+        return po.created_at.date() if po.created_at else None
+
+    @staticmethod
+    def _orders(
+        session: Session,
+        start: Optional[datetime.date] = None,
+        end: Optional[datetime.date] = None,
+        statuses: Optional[List[str]] = None,
+        include_cancelled: bool = False,
+    ) -> List[PurchaseOrder]:
+        """
+        Purchase orders in a date range, oldest first.
+
+        Args:
+            session: Database session
+            start: Optional inclusive start date
+            end: Optional inclusive end date
+            statuses: Only these statuses; None means all but the excluded ones
+            include_cancelled: Count cancelled orders as spend
+
+        Returns:
+            Matching PurchaseOrder instances
+        """
+        query = select(PurchaseOrder).options(
+            joinedload(PurchaseOrder.vendor),
+            joinedload(PurchaseOrder.product).joinedload(Product.brand),
+            joinedload(PurchaseOrder.quote),
+        )
+        if statuses:
+            query = query.where(PurchaseOrder.status.in_(statuses))
+        elif not include_cancelled:
+            query = query.where(
+                PurchaseOrder.status.not_in(SpendAnalyticsService.EXCLUDED_STATUSES)
+            )
+
+        orders = list(session.execute(query).unique().scalars().all())
+
+        # Filter on the effective date in Python, so orders with no order_date
+        # are bucketed and filtered consistently.
+        if start or end:
+            orders = [
+                po
+                for po in orders
+                if (date := SpendAnalyticsService._effective_date(po)) is not None
+                and (start is None or date >= start)
+                and (end is None or date <= end)
+            ]
+
+        return sorted(
+            orders,
+            key=lambda po: (
+                SpendAnalyticsService._effective_date(po) or datetime.date.min,
+                po.id,
+            ),
+        )
+
+    @staticmethod
+    def _period(po: PurchaseOrder) -> str:
+        """The YYYY-MM bucket an order falls in."""
+        date = SpendAnalyticsService._effective_date(po)
+        return date.strftime("%Y-%m") if date else "unknown"
+
+    @staticmethod
+    def spend_by_month(
+        session: Session,
+        start: Optional[datetime.date] = None,
+        end: Optional[datetime.date] = None,
+        statuses: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Total USD spend per calendar month.
+
+        Returns:
+            List of ``{"period", "total", "orders"}`` dicts, oldest first
+        """
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for po in SpendAnalyticsService._orders(session, start, end, statuses):
+            bucket = buckets.setdefault(
+                SpendAnalyticsService._period(po),
+                {
+                    "period": SpendAnalyticsService._period(po),
+                    "total": 0.0,
+                    "orders": 0,
+                },
+            )
+            bucket["total"] += SpendAnalyticsService._po_total(po)
+            bucket["orders"] += 1
+        return [buckets[key] for key in sorted(buckets)]
+
+    @staticmethod
+    def spend_by_vendor(
+        session: Session,
+        start: Optional[datetime.date] = None,
+        end: Optional[datetime.date] = None,
+        statuses: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Total USD spend per vendor, highest first."""
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for po in SpendAnalyticsService._orders(session, start, end, statuses):
+            bucket = buckets.setdefault(
+                po.vendor.name,
+                {"vendor": po.vendor.name, "total": 0.0, "orders": 0},
+            )
+            bucket["total"] += SpendAnalyticsService._po_total(po)
+            bucket["orders"] += 1
+        return sorted(buckets.values(), key=lambda b: b["total"], reverse=True)
+
+    @staticmethod
+    def spend_by_category(
+        session: Session,
+        start: Optional[datetime.date] = None,
+        end: Optional[datetime.date] = None,
+        statuses: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Total USD spend per product category, highest first."""
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for po in SpendAnalyticsService._orders(session, start, end, statuses):
+            key = po.product.category or "uncategorized"
+            bucket = buckets.setdefault(
+                key, {"category": key, "total": 0.0, "orders": 0}
+            )
+            bucket["total"] += SpendAnalyticsService._po_total(po)
+            bucket["orders"] += 1
+        return sorted(buckets.values(), key=lambda b: b["total"], reverse=True)
+
+    @staticmethod
+    def price_variance(
+        session: Session,
+        start: Optional[datetime.date] = None,
+        end: Optional[datetime.date] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Compare what each order cost against the best price on record.
+
+        Answers "did I buy at the best recorded price". ``delta`` is USD paid
+        above the best recorded unit price; negative means the order beat every
+        quote on file.
+
+        Returns:
+            List of dicts, worst overpayment first
+        """
+        best_prices = QuoteService.get_best_prices_by_product(session)
+
+        rows: List[Dict[str, Any]] = []
+        for po in SpendAnalyticsService._orders(session, start, end):
+            best = best_prices.get(po.product_id)
+            if best is None:
+                continue
+            unit_paid = SpendAnalyticsService._po_total(po) / max(po.quantity, 1)
+            delta = unit_paid - best.value
+            rows.append(
+                {
+                    "po_number": po.po_number,
+                    "product": po.product.name,
+                    "vendor": po.vendor.name,
+                    "unit_paid": unit_paid,
+                    "best_price": best.value,
+                    "best_vendor": best.vendor.name,
+                    "delta": delta,
+                    "delta_pct": (delta / best.value * 100) if best.value else 0.0,
+                }
+            )
+
+        return sorted(rows, key=lambda r: r["delta"], reverse=True)
+
+    @staticmethod
+    def summary(
+        session: Session,
+        start: Optional[datetime.date] = None,
+        end: Optional[datetime.date] = None,
+    ) -> Dict[str, Any]:
+        """Everything above in one call, plus the headline totals."""
+        orders = SpendAnalyticsService._orders(session, start, end)
+        total = sum(SpendAnalyticsService._po_total(po) for po in orders)
+        return {
+            "orders": len(orders),
+            "total": total,
+            "average": total / len(orders) if orders else 0.0,
+            "by_month": SpendAnalyticsService.spend_by_month(session, start, end),
+            "by_vendor": SpendAnalyticsService.spend_by_vendor(session, start, end),
+            "by_category": SpendAnalyticsService.spend_by_category(session, start, end),
+            "variance": SpendAnalyticsService.price_variance(session, start, end),
+        }

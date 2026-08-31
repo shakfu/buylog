@@ -1,0 +1,167 @@
+title {label: "buylog data model", size: "40"}
+[forex]
+    *id {label:"INTEGER"}
+    code {label:"VARCHAR(3)"}
+    date {label:"DATE"}
+    usd_per_unit {label:"FLOAT"}
+[vendor_brand]
+    *brand_id {label:"INTEGER"}
+    *vendor_id {label:"INTEGER"}
+[vendor]
+    *id {label:"INTEGER"}
+    address_line1 {label:"VARCHAR"}
+    address_line2 {label:"VARCHAR"}
+    city {label:"VARCHAR"}
+    contact_person {label:"VARCHAR"}
+    country {label:"VARCHAR"}
+    currency {label:"VARCHAR"}
+    discount {label:"FLOAT"}
+    discount_code {label:"VARCHAR"}
+    email {label:"VARCHAR"}
+    name {label:"VARCHAR"}
+    payment_terms {label:"VARCHAR"}
+    phone {label:"VARCHAR"}
+    postal_code {label:"VARCHAR"}
+    state {label:"VARCHAR"}
+    tax_id {label:"VARCHAR"}
+    url {label:"VARCHAR"}
+    website {label:"VARCHAR"}
+[brand]
+    *id {label:"INTEGER"}
+    name {label:"VARCHAR"}
+[specification]
+    *id {label:"INTEGER"}
+    description {label:"VARCHAR"}
+    name {label:"VARCHAR"}
+[specification_feature]
+    *id {label:"INTEGER"}
+    data_type {label:"VARCHAR"}
+    is_required {label:"INTEGER"}
+    max_value {label:"FLOAT"}
+    min_value {label:"FLOAT"}
+    name {label:"VARCHAR"}
+    specification_id {label:"INTEGER"}
+    unit {label:"VARCHAR"}
+[product_feature]
+    *id {label:"INTEGER"}
+    product_id {label:"INTEGER"}
+    specification_feature_id {label:"INTEGER"}
+    value_boolean {label:"INTEGER"}
+    value_number {label:"FLOAT"}
+    value_text {label:"VARCHAR"}
+[product]
+    *id {label:"INTEGER"}
+    brand_id {label:"INTEGER"}
+    category {label:"VARCHAR"}
+    name {label:"VARCHAR"}
+    specification_id {label:"INTEGER"}
+[quote]
+    *id {label:"INTEGER"}
+    created_at {label:"DATETIME"}
+    currency {label:"VARCHAR"}
+    discount {label:"FLOAT"}
+    original_currency {label:"VARCHAR"}
+    original_value {label:"FLOAT"}
+    product_id {label:"INTEGER"}
+    receipt_path {label:"VARCHAR"}
+    shipping_cost {label:"FLOAT"}
+    source_url {label:"VARCHAR"}
+    status {label:"VARCHAR"}
+    tax_rate {label:"FLOAT"}
+    value {label:"FLOAT"}
+    vendor_id {label:"INTEGER"}
+[quote_history]
+    *id {label:"INTEGER"}
+    change_type {label:"VARCHAR"}
+    changed_at {label:"DATETIME"}
+    new_value {label:"FLOAT"}
+    old_value {label:"FLOAT"}
+    quote_id {label:"INTEGER"}
+[purchase_order]
+    *id {label:"INTEGER"}
+    actual_delivery {label:"DATE"}
+    created_at {label:"DATETIME"}
+    currency {label:"VARCHAR"}
+    expected_delivery {label:"DATE"}
+    grand_total {label:"FLOAT"}
+    grand_total_usd {label:"FLOAT"}
+    invoice_number {label:"VARCHAR"}
+    notes {label:"VARCHAR"}
+    order_date {label:"DATE"}
+    po_number {label:"VARCHAR"}
+    product_id {label:"INTEGER"}
+    quantity {label:"INTEGER"}
+    quote_id {label:"INTEGER"}
+    shipping_cost {label:"FLOAT"}
+    status {label:"VARCHAR"}
+    tax {label:"FLOAT"}
+    total_amount {label:"FLOAT"}
+    unit_price {label:"FLOAT"}
+    vendor_id {label:"INTEGER"}
+[price_alert]
+    *id {label:"INTEGER"}
+    active {label:"INTEGER"}
+    created_at {label:"DATETIME"}
+    product_id {label:"INTEGER"}
+    threshold_currency {label:"VARCHAR"}
+    threshold_value {label:"FLOAT"}
+    triggered_at {label:"DATETIME"}
+[purchase_list_quote]
+    *purchase_list_id {label:"INTEGER"}
+    *quote_id {label:"INTEGER"}
+[purchase_list]
+    *id {label:"INTEGER"}
+    created_at {label:"DATETIME"}
+    description {label:"VARCHAR"}
+    name {label:"VARCHAR"}
+[note]
+    *id {label:"INTEGER"}
+    content {label:"VARCHAR"}
+    created_at {label:"DATETIME"}
+    entity_id {label:"INTEGER"}
+    entity_type {label:"VARCHAR"}
+    updated_at {label:"DATETIME"}
+[tag]
+    *id {label:"INTEGER"}
+    color {label:"VARCHAR"}
+    name {label:"VARCHAR"}
+[entity_tag]
+    *id {label:"INTEGER"}
+    entity_id {label:"INTEGER"}
+    entity_type {label:"VARCHAR"}
+    tag_id {label:"INTEGER"}
+[watchlist]
+    *id {label:"INTEGER"}
+    active {label:"INTEGER"}
+    created_at {label:"DATETIME"}
+    notes {label:"VARCHAR"}
+    product_id {label:"INTEGER"}
+    target_price {label:"FLOAT"}
+[audit_log]
+    *id {label:"INTEGER"}
+    action {label:"VARCHAR(50)"}
+    details {label:"TEXT"}
+    entity_id {label:"INTEGER"}
+    entity_type {label:"VARCHAR(50)"}
+    ip_address {label:"VARCHAR(45)"}
+    success {label:"INTEGER"}
+    timestamp {label:"DATETIME"}
+    user {label:"VARCHAR(100)"}
+vendor."id" 1--* vendor_brand."vendor_id"
+brand."id" 1--* vendor_brand."brand_id"
+specification."id" 1--* specification_feature."specification_id"
+product."id" 1--* product_feature."product_id"
+specification_feature."id" 1--* product_feature."specification_feature_id"
+brand."id" 1--* product."brand_id"
+specification."id" ?--* product."specification_id"
+product."id" 1--* quote."product_id"
+vendor."id" 1--* quote."vendor_id"
+quote."id" 1--* quote_history."quote_id"
+product."id" 1--* purchase_order."product_id"
+vendor."id" 1--* purchase_order."vendor_id"
+quote."id" ?--* purchase_order."quote_id"
+product."id" 1--* price_alert."product_id"
+purchase_list."id" 1--* purchase_list_quote."purchase_list_id"
+quote."id" 1--* purchase_list_quote."quote_id"
+tag."id" 1--* entity_tag."tag_id"
+product."id" 1--* watchlist."product_id"

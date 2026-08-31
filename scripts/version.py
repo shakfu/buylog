@@ -22,11 +22,11 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# File paths relative to script location
-SCRIPT_DIR = Path(__file__).parent
-INIT_FILE = SCRIPT_DIR / "src" / "buylog" / "__init__.py"
-PYPROJECT_FILE = SCRIPT_DIR / "pyproject.toml"
-CHANGELOG_FILE = SCRIPT_DIR / "CHANGELOG.md"
+# File paths, resolved against the project root (this script lives in scripts/)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+INIT_FILE = PROJECT_ROOT / "src" / "buylog" / "__init__.py"
+PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
+CHANGELOG_FILE = PROJECT_ROOT / "CHANGELOG.md"
 
 # Regex patterns
 INIT_VERSION_PATTERN = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']', re.MULTILINE)
@@ -131,7 +131,7 @@ def run_git_command(args: list[str], check: bool = True) -> subprocess.Completed
     """Run a git command."""
     return subprocess.run(
         ["git"] + args,
-        cwd=SCRIPT_DIR,
+        cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
         check=check,

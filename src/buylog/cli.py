@@ -2,22 +2,88 @@
 """CLI interface for buylog tool with CRUD operations"""
 
 import argparse
+import datetime
+import os
+import sys
 from pathlib import Path
 from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session as SessionType
 from tabulate import tabulate
-from .models import Base, Brand, Product, Vendor, Quote, Forex
+from .models import (
+    Brand,
+    Product,
+    Vendor,
+    Quote,
+    Forex,
+    init_db,
+    PO_STATUSES,
+    SPEC_DATA_TYPES,
+)
 from .config import Config
+from .services import (
+    ForexService,
+    ServiceError,
+    ValidationError,
+    DuplicateError,
+    NotFoundError,
+)
 
 # Setup logging
 logger = Config.setup_logging()
 
 # Database setup
 engine = Config.get_engine()
-Base.metadata.create_all(engine)
+init_db(engine)
 Session = Config.get_session_maker()
+
+
+def _parse_date(value: Optional[str]) -> Optional[datetime.date]:
+    """
+    Parse a YYYY-MM-DD command-line date.
+
+    Args:
+        value: Date string, or None
+
+    Returns:
+        Parsed date, or None if no value was given
+
+    Raises:
+        ValueError: If the string is not a valid YYYY-MM-DD date
+    """
+    if not value:
+        return None
+    try:
+        return datetime.datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"Invalid date '{value}'. Use YYYY-MM-DD") from None
+
+
+def confirm(question: str, assume_yes: bool = False) -> bool:
+    """
+    Ask the user to confirm an action.
+
+    Args:
+        question: Question to display, without the "(y/n)" suffix
+        assume_yes: Skip the prompt and answer yes (the --yes flag)
+
+    Returns:
+        True if the action was confirmed
+
+    Raises:
+        ValueError: If confirmation is needed but stdin is not interactive.
+                    Blocking on input() in a pipe or a cron job used to raise
+                    EOFError and surface as "Unexpected error occurred".
+    """
+    if assume_yes:
+        return True
+    if not sys.stdin or not sys.stdin.isatty():
+        raise ValueError(
+            f"{question} - cannot prompt on a non-interactive stdin. "
+            "Re-run with --yes to confirm automatically."
+        )
+    return input(f"{question} (y/n): ").strip().lower() == "y"
 
 
 def add_brand(session: SessionType, name: str) -> Optional[Brand]:
@@ -35,7 +101,7 @@ def add_brand(session: SessionType, name: str) -> Optional[Brand]:
         >>> brand = add_brand(session, "Apple")
         Added brand: Apple
     """
-    from .services import BrandService, DuplicateError, ValidationError
+    from .services import BrandService
 
     try:
         brand = BrandService.create(session, name)
@@ -49,39 +115,49 @@ def add_brand(session: SessionType, name: str) -> Optional[Brand]:
         return None
 
 
-def add_product(session, brand_name, product_name):
+def add_product(session, brand_name, product_name, category=None):
     """Add a new product under a brand"""
-    brand = Brand.by_name(session, brand_name)
-    if not brand:
+    from .services import ProductService
+
+    if not Brand.by_name(session, brand_name):
         print(f"Brand '{brand_name}' not found. Adding it first.")
-        brand = add_brand(session, brand_name)
+        if add_brand(session, brand_name) is None:
+            return None
 
-    existing = Product.by_name(session, product_name)
-    if existing:
+    try:
+        product = ProductService.create(
+            session, product_name, brand_name, category=category
+        )
+        print(f"Added product: {product_name} under brand: {brand_name}")
+        return product
+    except DuplicateError:
         print(f"Product '{product_name}' already exists")
-        return existing
-
-    product = Product(name=product_name, brand=brand)
-    session.add(product)
-    session.commit()
-    print(f"Added product: {product_name} under brand: {brand_name}")
-    return product
+        return ProductService.get_by_name(session, product_name)
+    except (ValidationError, NotFoundError) as e:
+        print(f"Error: {e}")
+        return None
 
 
 def add_vendor(session, name, currency="USD", discount_code=None, discount=0.0):
     """Add a new vendor"""
-    existing = Vendor.by_name(session, name)
-    if existing:
-        print(f"Vendor '{name}' already exists")
-        return existing
+    from .services import VendorService
 
-    vendor = Vendor(
-        name=name, currency=currency, discount_code=discount_code, discount=discount
-    )
-    session.add(vendor)
-    session.commit()
-    print(f"Added vendor: {name} (currency: {currency})")
-    return vendor
+    try:
+        vendor = VendorService.create(
+            session,
+            name,
+            currency=currency,
+            discount_code=discount_code,
+            discount=discount,
+        )
+        print(f"Added vendor: {name} (currency: {currency})")
+        return vendor
+    except DuplicateError:
+        print(f"Vendor '{name}' already exists")
+        return Vendor.by_name(session, name)
+    except ValidationError as e:
+        print(f"Error: {e}")
+        return None
 
 
 def add_quote(
@@ -92,62 +168,41 @@ def add_quote(
     brand_name=None,
     shipping_cost=None,
     tax_rate=None,
+    assume_yes=False,
 ):
     """Add a quote from a vendor for a product"""
-    from .services import QuoteHistoryService
+    from .services import QuoteService
 
     vendor = Vendor.by_name(session, vendor_name)
     if not vendor:
-        create_vendor = input(f"Vendor '{vendor_name}' not found. Create it? (y/n): ")
-        if create_vendor.lower() == "y":
-            vendor = add_vendor(session, vendor_name)
-        else:
+        if not confirm(f"Vendor '{vendor_name}' not found. Create it?", assume_yes):
+            return None
+        vendor = add_vendor(session, vendor_name)
+        if vendor is None:
             return None
 
-    product = Product.by_name(session, product_name)
-    if not product:
-        create_product = input(
-            f"Product '{product_name}' not found. Create it? (y/n): "
-        )
-        if create_product.lower() == "y":
-            if not brand_name:
-                brand_name = input("Enter brand name for the new product: ")
-            product = add_product(session, brand_name, product_name)
-        else:
+    if not Product.by_name(session, product_name):
+        if not confirm(f"Product '{product_name}' not found. Create it?", assume_yes):
             return None
-
-    value = float(price)
-    original_value = None
-    original_currency = None
-
-    if vendor.currency != "USD":
-        fx_rate = session.execute(
-            select(Forex).where(Forex.code == vendor.currency)
-        ).scalar_one_or_none()
-        if not fx_rate:
-            print(
-                f"Forex rate for '{vendor.currency}' not found. Please add it using the add-fx command."
+        if not brand_name:
+            raise ValueError(
+                f"Product '{product_name}' does not exist; "
+                "pass --brand to say which brand to create it under"
             )
-            return None
-        original_value = value
-        original_currency = vendor.currency
-        value = value * fx_rate.usd_per_unit
 
-    quote = Quote(
-        vendor=vendor,
-        product=product,
-        currency="USD",
-        value=value,
-        original_value=original_value,
-        original_currency=original_currency,
-        shipping_cost=shipping_cost,
-        tax_rate=tax_rate,
-    )
-    session.add(quote)
-    session.commit()
-
-    # Record creation in history
-    QuoteHistoryService.record_change(session, quote, None, value, "create")
+    try:
+        quote = QuoteService.create(
+            session,
+            vendor_name=vendor.name,
+            product_name=product_name,
+            price=float(price),
+            brand_name=brand_name,
+            shipping_cost=shipping_cost,
+            tax_rate=tax_rate,
+        )
+    except (ValidationError, NotFoundError) as e:
+        print(f"Error: {e}")
+        return None
 
     print(f"Added quote: {vendor_name} -> {product_name} = {price} {vendor.currency}")
     if shipping_cost:
@@ -172,19 +227,18 @@ def add_fx(session, code, usd_per_unit, date=None):
             print("Error: Invalid date format. Use YYYY-MM-DD")
             return None
 
-    # Check if rate already exists for this code and date
-    existing = session.execute(
-        select(Forex).where(Forex.code == code, Forex.date == date)
-    ).scalar_one_or_none()
-    if existing:
+    try:
+        fx = ForexService.create(session, code, usd_per_unit, date=date)
+        print(f"Added forex rate: {code} = {usd_per_unit} USD per unit on {date}")
+        return fx
+    except DuplicateError:
         print(f"Forex rate for '{code}' on {date} already exists")
-        return existing
-
-    fx = Forex(code=code, usd_per_unit=usd_per_unit, date=date)
-    session.add(fx)
-    session.commit()
-    print(f"Added forex rate: {code} = {usd_per_unit} USD per unit on {date}")
-    return fx
+        return session.execute(
+            select(Forex).where(Forex.code == code.upper(), Forex.date == date)
+        ).scalar_one_or_none()
+    except ValidationError as e:
+        print(f"Error: {e}")
+        return None
 
 
 def list_entities(
@@ -236,93 +290,132 @@ def list_entities(
 
     elif entity_type == "quotes":
         quotes = QuoteService.get_all(session, filter_by=filter_by, limit=limit)
-        headers = ["ID", "Vendor", "Product", "Price", "Currency"]
+        headers = ["ID", "Vendor", "Product", "Price (USD)", "As Entered"]
         data = [
             [
                 q.id,
                 q.vendor.name,
                 f"{q.product.brand.name} {q.product.name}",
-                q.value,
-                q.currency,
+                f"${q.value:,.2f}",
+                q.source_price,
             ]
             for q in quotes
         ]
         print(tabulate(data, headers=headers, tablefmt="grid"))
 
+    elif entity_type == "forex":
+        rates = (
+            session.execute(
+                select(Forex).order_by(Forex.date.desc(), Forex.code).limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        headers = ["ID", "Date", "Code", "USD per unit"]
+        data = [[f.id, f.date, f.code, f"{f.usd_per_unit:.6f}"] for f in rates]
+        print(tabulate(data, headers=headers, tablefmt="grid"))
 
-def delete_entity(session, entity_type, name=None, id=None):
-    """Delete an entity by name or ID"""
+
+def delete_entity(session, entity_type, name=None, id=None, assume_yes=False):
+    """
+    Delete an entity by name or ID.
+
+    Deletes go through the service layer, so dependent rows (a quote's price
+    history, a product's alerts and watchlist entries) are removed with the
+    entity instead of being left orphaned.
+
+    Returns:
+        A process exit code.
+    """
+    from .services import BrandService, ProductService, QuoteService, VendorService
 
     if entity_type == "quote":
         if not id:
             print("Please provide the ID of the quote to delete using --id.")
-
-            return
-
-        entity = session.get(Quote, id)
-
+            return 1
+        entity = QuoteService.get_by_id(session, id)
+        label = str(id)
     else:
         if not name:
             print(
                 f"Please provide the name of the {entity_type} to delete using --name."
             )
-
-            return
-
-        if entity_type == "brand":
-            entity = Brand.by_name(session, name)
-
-        elif entity_type == "product":
-            entity = Product.by_name(session, name)
-
-        elif entity_type == "vendor":
-            entity = Vendor.by_name(session, name)
+            return 1
+        lookup = {
+            "brand": Brand.by_name,
+            "product": Product.by_name,
+            "vendor": Vendor.by_name,
+        }[entity_type]
+        entity = lookup(session, name)
+        label = name
 
     if not entity:
         print(f"{entity_type.capitalize()} not found.")
+        return 1
 
-        return
+    # Deleting a vendor or product takes its quotes and their price history
+    # with it, so say so before asking.
+    dependents = ""
+    quote_count = len(getattr(entity, "quotes", []) or [])
+    if quote_count:
+        dependents = f" and its {quote_count} quote(s)"
 
-    confirm = input(
-        f"Are you sure you want to delete {entity_type} '{entity.name if name else entity.id}'? (y/n): "
-    )
+    if not confirm(
+        f"Are you sure you want to delete {entity_type} '{label}'{dependents}?",
+        assume_yes,
+    ):
+        print("Cancelled.")
+        return 0
 
-    if confirm.lower() == "y":
-        session.delete(entity)
+    deleters = {
+        "brand": BrandService.delete,
+        "product": ProductService.delete,
+        "vendor": VendorService.delete,
+        "quote": QuoteService.delete,
+    }
+    try:
+        deleters[entity_type](session, id if entity_type == "quote" else name)
+    except (NotFoundError, ValidationError) as e:
+        print(f"Error: {e}")
+        return 1
 
-        session.commit()
-
-        print(f"Deleted {entity_type}: '{entity.name if name else entity.id}'")
+    print(f"Deleted {entity_type}: '{label}'")
+    return 0
 
 
 def update_entity(session, entity_type, name, new_name):
-    """Update an entity's name"""
+    """
+    Rename an entity through the service layer.
 
-    if entity_type == "brand":
-        entity = Brand.by_name(session, name)
+    Returns:
+        A process exit code.
+    """
+    from .services import BrandService, ProductService, VendorService
 
-    elif entity_type == "product":
-        entity = Product.by_name(session, name)
-
-    elif entity_type == "vendor":
-        entity = Vendor.by_name(session, name)
-
-    else:
+    updaters = {
+        "brand": BrandService.update,
+        "product": ProductService.update,
+        "vendor": VendorService.update,
+    }
+    if entity_type not in updaters:
         print(f"Updating '{entity_type}' is not supported.")
+        return 1
 
-        return
+    if not new_name:
+        print("Nothing to update: pass --new-name.")
+        return 1
 
-    if not entity:
+    try:
+        updaters[entity_type](session, name, new_name)
+    except NotFoundError:
         print(f"{entity_type.capitalize()} '{name}' not found.")
+        return 1
+    except (ValidationError, DuplicateError) as e:
+        print(f"Error: {e}")
+        return 1
 
-        return
-
-    if new_name:
-        entity.name = new_name
-
-        session.commit()
-
-        print(f"Updated {entity_type} '{name}' to '{new_name}'.")
+    print(f"Updated {entity_type} '{name}' to '{new_name}'.")
+    return 0
 
 
 def seed_database(session):
@@ -474,9 +567,7 @@ def seed_database(session):
         original_currency = None
 
         if vendor.currency != "USD":
-            fx_rate = session.execute(
-                select(Forex).where(Forex.code == vendor.currency)
-            ).scalar_one_or_none()
+            fx_rate = ForexService.get_latest(session, vendor.currency)
             if fx_rate:
                 original_value = value
                 original_currency = vendor.currency
@@ -548,9 +639,26 @@ def search_entities(session, query):
         print(tabulate(data, headers=headers, tablefmt="grid"))
 
 
-def main():
+def main(argv: Optional[list[str]] = None) -> int:
+    """
+    Run the buylog CLI.
+
+    Args:
+        argv: Argument list, defaulting to ``sys.argv[1:]``
+
+    Returns:
+        Process exit code: 0 on success, 1 on a handled error. Returning a code
+        rather than always falling off the end lets scripts and cron detect
+        failures.
+    """
     parser = argparse.ArgumentParser(
         description="Buyer - Purchasing support and vendor quote management"
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Assume yes for all confirmation prompts (for non-interactive use)",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -559,6 +667,7 @@ def main():
     opt = add_parser.add_argument
     opt("-b", "--brand", type=str, help="Add a brand")
     opt("-p", "--product", type=str, help="Add a product (requires --brand)")
+    opt("--category", type=str, help="Category for a new product")
     opt("-v", "--vendor", type=str, help="Add a vendor")
     opt(
         "-q",
@@ -883,6 +992,181 @@ def main():
     )
     watchlist_remove_parser.add_argument("id", type=int, help="Watchlist entry ID")
 
+    # Purchase order command
+    po_parser = subparsers.add_parser("po", help="Manage purchase orders")
+    po_subparsers = po_parser.add_subparsers(
+        dest="po_command", help="Purchase order commands"
+    )
+
+    # PO create
+    po_create_parser = po_subparsers.add_parser(
+        "create", help="Create a purchase order"
+    )
+    po_create_parser.add_argument("po_number", type=str, help="Unique PO number")
+    po_create_parser.add_argument("--vendor", type=str, help="Vendor name")
+    po_create_parser.add_argument("--product", type=str, help="Product name")
+    po_create_parser.add_argument("--price", type=float, help="Unit price")
+    po_create_parser.add_argument(
+        "--quantity", type=int, default=1, help="Number of units (default: 1)"
+    )
+    po_create_parser.add_argument(
+        "--from-quote", type=int, help="Create from an existing quote ID"
+    )
+    po_create_parser.add_argument("--shipping", type=float, help="Shipping cost")
+    po_create_parser.add_argument("--tax", type=float, help="Tax amount")
+    po_create_parser.add_argument(
+        "--order-date", type=str, help="Order date (YYYY-MM-DD)"
+    )
+    po_create_parser.add_argument(
+        "--expected-delivery", type=str, help="Expected delivery date (YYYY-MM-DD)"
+    )
+    po_create_parser.add_argument("--invoice", type=str, help="Invoice number")
+    po_create_parser.add_argument("--notes", type=str, help="Notes")
+
+    # PO list
+    po_list_parser = po_subparsers.add_parser("list", help="List purchase orders")
+    po_list_parser.add_argument(
+        "--status", type=str, choices=PO_STATUSES, help="Filter by status"
+    )
+    po_list_parser.add_argument("--vendor", type=str, help="Filter by vendor name")
+    po_list_parser.add_argument(
+        "--limit", type=int, default=100, help="Maximum rows (default: 100)"
+    )
+
+    # PO show
+    po_show_parser = po_subparsers.add_parser("show", help="Show a purchase order")
+    po_show_parser.add_argument("po_number", type=str, help="PO number")
+
+    # PO update
+    po_update_parser = po_subparsers.add_parser(
+        "update", help="Update a purchase order"
+    )
+    po_update_parser.add_argument("po_number", type=str, help="PO number")
+    po_update_parser.add_argument(
+        "--status", type=str, choices=PO_STATUSES, required=True, help="New status"
+    )
+    po_update_parser.add_argument(
+        "--delivery-date", type=str, help="Actual delivery date (YYYY-MM-DD)"
+    )
+
+    # Specification command
+    spec_parser = subparsers.add_parser("spec", help="Manage specifications")
+    spec_subparsers = spec_parser.add_subparsers(
+        dest="spec_command", help="Specification commands"
+    )
+
+    # Spec create
+    spec_create_parser = spec_subparsers.add_parser(
+        "create", help="Create a specification"
+    )
+    spec_create_parser.add_argument("name", type=str, help="Specification name")
+    spec_create_parser.add_argument("--description", type=str, help="Description")
+
+    # Spec add-feature
+    spec_feature_parser = spec_subparsers.add_parser(
+        "add-feature", help="Add a feature to a specification"
+    )
+    spec_feature_parser.add_argument("spec", type=str, help="Specification name")
+    spec_feature_parser.add_argument("feature", type=str, help="Feature name")
+    spec_feature_parser.add_argument(
+        "--type",
+        dest="data_type",
+        type=str,
+        choices=SPEC_DATA_TYPES,
+        default="text",
+        help="Data type (default: text)",
+    )
+    spec_feature_parser.add_argument("--unit", type=str, help='Unit (e.g. "MP", "kg")')
+    spec_feature_parser.add_argument(
+        "--required", action="store_true", help="Mark the feature as required"
+    )
+    spec_feature_parser.add_argument("--min", type=float, help="Minimum value")
+    spec_feature_parser.add_argument("--max", type=float, help="Maximum value")
+
+    # Spec list
+    spec_list_parser = spec_subparsers.add_parser("list", help="List specifications")
+    spec_list_parser.add_argument(
+        "--limit", type=int, default=100, help="Maximum rows (default: 100)"
+    )
+
+    # Spec show
+    spec_show_parser = spec_subparsers.add_parser(
+        "show", help="Show a specification and its features"
+    )
+    spec_show_parser.add_argument("name", type=str, help="Specification name")
+
+    # Spec delete
+    spec_delete_parser = spec_subparsers.add_parser(
+        "delete", help="Delete a specification"
+    )
+    spec_delete_parser.add_argument("name", type=str, help="Specification name")
+
+    # Check command (for cron)
+    check_parser = subparsers.add_parser(
+        "check",
+        help="Check price alerts and watchlist targets, and notify (for cron)",
+    )
+    check_parser.add_argument(
+        "--notify",
+        type=str,
+        help="Comma-separated notification channels "
+        "(stdout, ntfy, webhook, desktop, email); "
+        "defaults to $BUYLOG_NOTIFY, else stdout",
+    )
+    check_parser.add_argument(
+        "--refresh-fx",
+        action="store_true",
+        help="Refresh forex rates before checking",
+    )
+    check_parser.add_argument(
+        "--refresh-scrapes",
+        action="store_true",
+        help="Re-scrape tracked product URLs before checking",
+    )
+    check_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Print nothing when nothing triggered (for cron)",
+    )
+
+    # Forex refresh command
+    fx_parser = subparsers.add_parser("fx", help="Manage forex rates")
+    fx_subparsers = fx_parser.add_subparsers(dest="fx_command", help="Forex commands")
+    fx_refresh_parser = fx_subparsers.add_parser(
+        "refresh", help="Fetch current rates from a public API"
+    )
+    fx_refresh_parser.add_argument(
+        "codes",
+        type=str,
+        nargs="*",
+        help="Currency codes to refresh (default: every currency your vendors use)",
+    )
+    fx_refresh_parser.add_argument(
+        "--date", type=str, help="Record the rates under this date (YYYY-MM-DD)"
+    )
+    fx_list_parser = fx_subparsers.add_parser("list", help="List forex rates")
+    fx_list_parser.add_argument(
+        "--limit", type=int, default=100, help="Maximum rows (default: 100)"
+    )
+
+    # Spend analytics command
+    spend_parser = subparsers.add_parser(
+        "spend", help="Report on money committed via purchase orders"
+    )
+    spend_parser.add_argument(
+        "report",
+        nargs="?",
+        default="summary",
+        choices=["summary", "month", "vendor", "category", "variance"],
+        help="Which report to show (default: summary)",
+    )
+    spend_parser.add_argument(
+        "--from", dest="start", type=str, help="Start date (YYYY-MM-DD)"
+    )
+    spend_parser.add_argument(
+        "--to", dest="end", type=str, help="End date (YYYY-MM-DD)"
+    )
+
     # Import command
     import_parser = subparsers.add_parser("import", help="Import data from files")
     import_parser.add_argument(
@@ -1106,6 +1390,24 @@ def main():
         "--brand", type=str, help="Brand name (for new products)"
     )
 
+    # Scrape refresh
+    scrape_refresh_parser = scrape_subparsers.add_parser(
+        "refresh", help="Re-scrape tracked product URLs and record price changes"
+    )
+    scrape_refresh_parser.add_argument(
+        "--quote-id",
+        type=int,
+        action="append",
+        dest="quote_ids",
+        help="Only refresh this quote (repeatable)",
+    )
+    scrape_refresh_parser.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_tracked",
+        help="List tracked quotes without re-scraping",
+    )
+
     # Report command
     report_parser = subparsers.add_parser("report", help="Generate HTML reports")
     report_subparsers = report_parser.add_subparsers(
@@ -1135,6 +1437,18 @@ def main():
     )
     report_vendor_parser.add_argument(
         "--output", type=str, help="Output HTML file path"
+    )
+
+    # Report spend-analysis
+    report_spend_parser = report_subparsers.add_parser(
+        "spend-analysis", help="What was actually spent, from purchase orders"
+    )
+    report_spend_parser.add_argument("--output", type=str, help="Output HTML file path")
+    report_spend_parser.add_argument(
+        "--from", dest="start", type=str, help="Start date (YYYY-MM-DD)"
+    )
+    report_spend_parser.add_argument(
+        "--to", dest="end", type=str, help="End date (YYYY-MM-DD)"
     )
 
     # Migrate command
@@ -1180,66 +1494,103 @@ def main():
         help="Output file path (default: <table>-template.<format>)",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.command:
         parser.print_help()
-        return
+        return 1
 
     session = Session()
 
     try:
         if args.command == "add":
+            # A quote needs both a vendor and a product; without them the
+            # price used to be accepted and then silently discarded.
+            if args.quote is not None and not (args.vendor and args.product):
+                missing = []
+                if not args.vendor:
+                    missing.append("--vendor")
+                if not args.product:
+                    missing.append("--product")
+                print(f"Error: --quote also requires {' and '.join(missing)}")
+                return 1
+
             if args.brand and not args.product and not args.vendor:
                 # Add brand only
-                add_brand(session, args.brand)
+                if add_brand(session, args.brand) is None:
+                    return 1
 
             elif args.brand and args.product and not args.vendor:
                 # Add product under brand
-                add_product(session, args.brand, args.product)
+                if (
+                    add_product(
+                        session,
+                        args.brand,
+                        args.product,
+                        getattr(args, "category", None),
+                    )
+                    is None
+                ):
+                    return 1
 
             elif args.vendor and not args.product:
                 # Add vendor only
-                add_vendor(
-                    session,
-                    args.vendor,
-                    args.currency,
-                    args.discount_code,
-                    args.discount,
-                )
+                if (
+                    add_vendor(
+                        session,
+                        args.vendor,
+                        args.currency,
+                        args.discount_code,
+                        args.discount,
+                    )
+                    is None
+                ):
+                    return 1
 
             elif args.vendor and args.product and args.quote is not None:
                 # Add quote
-                add_quote(
-                    session,
-                    args.vendor,
-                    args.product,
-                    args.quote,
-                    args.brand,
-                    getattr(args, "shipping", None),
-                    getattr(args, "tax_rate", None),
-                )
+                if (
+                    add_quote(
+                        session,
+                        args.vendor,
+                        args.product,
+                        args.quote,
+                        args.brand,
+                        getattr(args, "shipping", None),
+                        getattr(args, "tax_rate", None),
+                        assume_yes=args.yes,
+                    )
+                    is None
+                ):
+                    return 1
 
             else:
                 print("Invalid combination of arguments for 'add' command")
                 add_parser.print_help()
+                return 1
 
         elif args.command == "add-fx":
-            add_fx(
-                session,
-                args.code,
-                args.usd_per_unit,
-                args.date if hasattr(args, "date") else None,
-            )
+            if (
+                add_fx(
+                    session,
+                    args.code,
+                    args.usd_per_unit,
+                    args.date if hasattr(args, "date") else None,
+                )
+                is None
+            ):
+                return 1
 
         elif args.command == "list":
             list_entities(session, args.type, args.filter, args.sort_by)
 
         elif args.command == "delete":
-            delete_entity(session, args.type, args.name, args.id)
+            return delete_entity(
+                session, args.type, args.name, args.id, assume_yes=args.yes
+            )
 
         elif args.command == "update":
-            update_entity(session, args.type, args.name, args.new_name)
+            return update_entity(session, args.type, args.name, args.new_name)
 
         elif args.command == "search":
             search_entities(session, args.query)
@@ -1249,13 +1600,13 @@ def main():
             from .tui import main as tui_main
 
             tui_main()
-            return
+            return 0
 
         elif args.command == "seed":
             seed_database(session)
 
         elif args.command == "alert":
-            from .services import PriceAlertService, NotFoundError, ValidationError
+            from .services import PriceAlertService
 
             if args.alert_command == "add":
                 try:
@@ -1267,15 +1618,17 @@ def main():
                     )
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
                 except ValidationError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.alert_command == "list":
                 if args.triggered:
                     alerts = PriceAlertService.get_triggered(session)
                     if not alerts:
                         print("No triggered alerts")
-                        return
+                        return 0
                     headers = ["ID", "Product", "Threshold", "Triggered At"]
                     data = [
                         [
@@ -1290,7 +1643,7 @@ def main():
                     alerts = PriceAlertService.get_all(session)
                     if not alerts:
                         print("No alerts")
-                        return
+                        return 0
                     headers = ["ID", "Product", "Threshold", "Status", "Triggered At"]
                     data = [
                         [
@@ -1310,9 +1663,11 @@ def main():
                     print(f"Deactivated alert #{alert.id}")
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
 
             else:
                 print("Usage: buylog alert [add|list|deactivate]")
+                return 1
 
         elif args.command == "history":
             from .services import QuoteHistoryService, QuoteService
@@ -1321,7 +1676,7 @@ def main():
                 history = QuoteHistoryService.get_history(session, args.quote_id)
                 if not history:
                     print(f"No history for quote #{args.quote_id}")
-                    return
+                    return 0
                 headers = ["Date", "Old Price", "New Price", "Type"]
                 data = [
                     [
@@ -1339,11 +1694,11 @@ def main():
                 product = Product.by_name(session, args.product)
                 if not product:
                     print(f"Product '{args.product}' not found")
-                    return
+                    return 1
                 history = QuoteHistoryService.get_product_history(session, product.id)
                 if not history:
                     print(f"No history for product '{args.product}'")
-                    return
+                    return 0
                 headers = ["Date", "Quote ID", "Old Price", "New Price", "Type"]
                 data = [
                     [
@@ -1360,9 +1715,10 @@ def main():
 
             else:
                 print("Usage: buylog history [--product NAME | --quote-id ID]")
+                return 1
 
         elif args.command == "compare":
-            from .services import ComparisonService, NotFoundError
+            from .services import ComparisonService
 
             def print_comparison(comparison: dict) -> None:
                 """Print a single product comparison."""
@@ -1433,12 +1789,14 @@ def main():
                     print(
                         "Usage: buylog compare [--product NAME | --search TERM | --category CAT | --brand NAME]"
                     )
+                    return 1
 
             except NotFoundError as e:
                 print(f"Error: {e}")
+                return 1
 
         elif args.command == "category":
-            from .services import ComparisonService, NotFoundError
+            from .services import ComparisonService
 
             if args.category_command == "set":
                 try:
@@ -1450,6 +1808,7 @@ def main():
                     )
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.category_command == "list":
                 categories = ComparisonService.get_categories(session)
@@ -1472,13 +1831,11 @@ def main():
 
             else:
                 print("Usage: buylog category [set|list]")
+                return 1
 
         elif args.command == "purchase-list":
             from .services import (
                 PurchaseListService,
-                NotFoundError,
-                DuplicateError,
-                ValidationError,
             )
 
             if args.list_command == "create":
@@ -1489,8 +1846,10 @@ def main():
                     print(f"Created purchase list '{plist.name}'")
                 except DuplicateError as e:
                     print(f"Error: {e}")
+                    return 1
                 except ValidationError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.list_command == "add":
                 try:
@@ -1500,6 +1859,7 @@ def main():
                     print(f"Added quote #{args.quote_id} to list '{args.list_name}'")
                 except (NotFoundError, DuplicateError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.list_command == "remove":
                 try:
@@ -1511,12 +1871,14 @@ def main():
                     )
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.list_command == "show":
-                plist = PurchaseListService.get_by_name(session, args.name)
-                if not plist:
+                found_list = PurchaseListService.get_by_name(session, args.name)
+                if not found_list:
                     print(f"Purchase list '{args.name}' not found")
-                    return
+                    return 1
+                plist = found_list
                 print(f"Purchase List: {plist.name}")
                 if plist.description:
                     print(f"Description: {plist.description}")
@@ -1545,12 +1907,13 @@ def main():
                     print(f"Deleted purchase list '{args.name}'")
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.list_command == "all":
                 plists = PurchaseListService.get_all(session)
                 if not plists:
                     print("No purchase lists")
-                    return
+                    return 0
                 headers = ["Name", "Description", "Quotes", "Total"]
                 data = [
                     [
@@ -1565,9 +1928,10 @@ def main():
 
             else:
                 print("Usage: buylog purchase-list [create|add|remove|show|delete|all]")
+                return 1
 
         elif args.command == "status":
-            from .services import QuoteService, NotFoundError, ValidationError
+            from .services import QuoteService
 
             if args.status_command == "set":
                 try:
@@ -1575,13 +1939,14 @@ def main():
                     print(f"Set status '{args.status}' for quote #{args.quote_id}")
                 except (NotFoundError, ValidationError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.status_command == "list":
                 try:
                     quotes = QuoteService.get_by_status(session, args.status)
                     if not quotes:
                         print(f"No quotes with status '{args.status}'")
-                        return
+                        return 0
                     headers = ["ID", "Vendor", "Product", "Price", "Status"]
                     data = [
                         [
@@ -1597,12 +1962,14 @@ def main():
                     print(tabulate(data, headers=headers, tablefmt="grid"))
                 except ValidationError as e:
                     print(f"Error: {e}")
+                    return 1
 
             else:
                 print("Usage: buylog status [set|list]")
+                return 1
 
         elif args.command == "note":
-            from .services import NoteService, NotFoundError, ValidationError
+            from .services import NoteService
 
             if args.note_command == "add":
                 try:
@@ -1614,6 +1981,7 @@ def main():
                     )
                 except ValidationError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.note_command == "list":
                 notes = NoteService.get_for_entity(
@@ -1621,7 +1989,7 @@ def main():
                 )
                 if not notes:
                     print(f"No notes for {args.entity_type}:{args.entity_id}")
-                    return
+                    return 0
                 print(f"Notes for {args.entity_type}:{args.entity_id}:")
                 for note in notes:
                     print(f"\n#{note.id} ({note.created_at}):")
@@ -1633,12 +2001,14 @@ def main():
                     print(f"Deleted note #{args.note_id}")
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
 
             else:
                 print("Usage: buylog note [add|list|delete]")
+                return 1
 
         elif args.command == "tag":
-            from .services import TagService, NotFoundError, DuplicateError
+            from .services import TagService
 
             if args.tag_command == "add":
                 try:
@@ -1650,6 +2020,7 @@ def main():
                     )
                 except DuplicateError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.tag_command == "remove":
                 try:
@@ -1661,6 +2032,7 @@ def main():
                     )
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.tag_command == "list":
                 if args.entity_type and args.entity_id:
@@ -1670,7 +2042,7 @@ def main():
                     )
                     if not tags:
                         print(f"No tags for {args.entity_type}:{args.entity_id}")
-                        return
+                        return 0
                     print(f"Tags for {args.entity_type}:{args.entity_id}:")
                     for tag in tags:
                         color_info = f" ({tag.color})" if tag.color else ""
@@ -1680,7 +2052,7 @@ def main():
                     tags = TagService.get_all(session)
                     if not tags:
                         print("No tags")
-                        return
+                        return 0
                     headers = ["Name", "Color"]
                     data = [[t.name, t.color or "-"] for t in tags]
                     print(tabulate(data, headers=headers, tablefmt="grid"))
@@ -1692,18 +2064,20 @@ def main():
                     )
                     if not entity_tags:
                         print(f"No entities with tag '{args.tag_name}'")
-                        return
+                        return 0
                     print(f"Entities with tag '{args.tag_name}':")
                     for et in entity_tags:
                         print(f"  - {et.entity_type}:{et.entity_id}")
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
 
             else:
                 print("Usage: buylog tag [add|remove|list|search]")
+                return 1
 
         elif args.command == "watchlist":
-            from .services import WatchlistService, NotFoundError, DuplicateError
+            from .services import WatchlistService
 
             if args.watchlist_command == "add":
                 try:
@@ -1716,6 +2090,7 @@ def main():
                     print(f"Added '{args.product}' to watchlist (ID: {watchlist.id})")
                 except (NotFoundError, DuplicateError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.watchlist_command == "list":
                 if getattr(args, "all", False):
@@ -1724,7 +2099,7 @@ def main():
                     items = WatchlistService.get_active(session)
                 if not items:
                     print("Watchlist is empty")
-                    return
+                    return 0
                 headers = ["ID", "Product", "Brand", "Target Price", "Notes", "Status"]
                 data = [
                     [
@@ -1752,6 +2127,7 @@ def main():
                     print(f"Updated watchlist entry #{args.id}")
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.watchlist_command == "remove":
                 try:
@@ -1759,9 +2135,481 @@ def main():
                     print(f"Removed watchlist entry #{args.id}")
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
 
             else:
                 print("Usage: buylog watchlist [add|list|update|remove]")
+                return 1
+
+        elif args.command == "po":
+            from .services import PurchaseOrderService
+
+            if args.po_command == "create":
+                try:
+                    order_date = _parse_date(getattr(args, "order_date", None))
+                    expected = _parse_date(getattr(args, "expected_delivery", None))
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    return 1
+
+                try:
+                    if args.from_quote:
+                        po = PurchaseOrderService.create_from_quote(
+                            session,
+                            po_number=args.po_number,
+                            quote_id=args.from_quote,
+                            quantity=args.quantity,
+                            order_date=order_date,
+                            expected_delivery=expected,
+                            shipping_cost=args.shipping,
+                            tax=args.tax,
+                            notes=args.notes,
+                        )
+                    else:
+                        missing = [
+                            flag
+                            for flag, value in (
+                                ("--vendor", args.vendor),
+                                ("--product", args.product),
+                                ("--price", args.price),
+                            )
+                            if value is None
+                        ]
+                        if missing:
+                            print(
+                                "Error: "
+                                + ", ".join(missing)
+                                + " required (or use --from-quote)"
+                            )
+                            return 1
+                        po = PurchaseOrderService.create(
+                            session,
+                            po_number=args.po_number,
+                            vendor_name=args.vendor,
+                            product_name=args.product,
+                            unit_price=args.price,
+                            quantity=args.quantity,
+                            order_date=order_date,
+                            expected_delivery=expected,
+                            shipping_cost=args.shipping,
+                            tax=args.tax,
+                            invoice_number=args.invoice,
+                            notes=args.notes,
+                        )
+                    print(
+                        f"Created purchase order {po.po_number}: "
+                        f"{po.quantity} x {po.product.name} = ${po.grand_total:.2f}"
+                    )
+                except (ValidationError, DuplicateError, NotFoundError) as e:
+                    print(f"Error: {e}")
+                    return 1
+
+            elif args.po_command == "list":
+                try:
+                    orders = PurchaseOrderService.get_all(
+                        session,
+                        status=args.status,
+                        vendor_name=args.vendor,
+                        limit=args.limit,
+                    )
+                except ValidationError as e:
+                    print(f"Error: {e}")
+                    return 1
+                if not orders:
+                    print("No purchase orders found")
+                    return 0
+                headers = [
+                    "PO Number",
+                    "Vendor",
+                    "Product",
+                    "Qty",
+                    "Unit Price",
+                    "Total",
+                    "Status",
+                ]
+                data = [
+                    [
+                        po.po_number,
+                        po.vendor.name,
+                        po.product.name,
+                        po.quantity,
+                        f"{po.unit_price:.2f} {po.currency}",
+                        f"{po.grand_total:.2f} {po.currency}",
+                        po.status,
+                    ]
+                    for po in orders
+                ]
+                print(tabulate(data, headers=headers, tablefmt="grid"))
+
+            elif args.po_command == "show":
+                found_po = PurchaseOrderService.get_by_po_number(
+                    session, args.po_number
+                )
+                if not found_po:
+                    print(f"Purchase order '{args.po_number}' not found")
+                    return 1
+                po = found_po
+                rows = [
+                    ("PO Number", po.po_number),
+                    ("Vendor", po.vendor.name),
+                    ("Product", po.product.name),
+                    ("Quantity", po.quantity),
+                    ("Unit Price", f"{po.unit_price:.2f} {po.currency}"),
+                    ("Subtotal", f"{po.total_amount:.2f} {po.currency}"),
+                    (
+                        "Shipping",
+                        f"{po.shipping_cost:.2f}" if po.shipping_cost else "-",
+                    ),
+                    ("Tax", f"{po.tax:.2f}" if po.tax else "-"),
+                    ("Grand Total", f"{po.grand_total:.2f} {po.currency}"),
+                    ("Status", po.status),
+                    ("Order Date", po.order_date or "-"),
+                    ("Expected Delivery", po.expected_delivery or "-"),
+                    ("Actual Delivery", po.actual_delivery or "-"),
+                    ("Invoice", po.invoice_number or "-"),
+                    ("Notes", po.notes or "-"),
+                ]
+                print(tabulate(rows, headers=["Field", "Value"], tablefmt="grid"))
+
+            elif args.po_command == "update":
+                try:
+                    delivery = _parse_date(getattr(args, "delivery_date", None))
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    return 1
+                try:
+                    po = PurchaseOrderService.update_status(
+                        session, args.po_number, args.status, actual_delivery=delivery
+                    )
+                    print(f"Updated {po.po_number} status to '{po.status}'")
+                except (NotFoundError, ValidationError) as e:
+                    print(f"Error: {e}")
+                    return 1
+
+            else:
+                print("Usage: buylog po [create|list|show|update]")
+                return 1
+
+        elif args.command == "spec":
+            from .services import SpecificationService
+
+            if args.spec_command == "create":
+                try:
+                    spec = SpecificationService.create(
+                        session, args.name, args.description
+                    )
+                    print(f"Created specification: {spec.name}")
+                except (ValidationError, DuplicateError) as e:
+                    print(f"Error: {e}")
+                    return 1
+
+            elif args.spec_command == "add-feature":
+                try:
+                    feature = SpecificationService.add_feature(
+                        session,
+                        spec_name=args.spec,
+                        feature_name=args.feature,
+                        data_type=args.data_type,
+                        unit=args.unit,
+                        is_required=args.required,
+                        min_value=args.min,
+                        max_value=args.max,
+                    )
+                    print(f"Added feature '{feature.name}' to '{args.spec}'")
+                except (ValidationError, NotFoundError) as e:
+                    print(f"Error: {e}")
+                    return 1
+
+            elif args.spec_command == "list":
+                specs = SpecificationService.get_all(session, limit=args.limit)
+                if not specs:
+                    print("No specifications found")
+                    return 0
+                headers = ["Name", "Description", "Features"]
+                data = [[s.name, s.description or "-", len(s.features)] for s in specs]
+                print(tabulate(data, headers=headers, tablefmt="grid"))
+
+            elif args.spec_command == "show":
+                found_spec = SpecificationService.get_by_name(session, args.name)
+                if not found_spec:
+                    print(f"Specification '{args.name}' not found")
+                    return 1
+                spec = found_spec
+                print(f"{spec.name}: {spec.description or '(no description)'}")
+                if not spec.features:
+                    print("No features defined")
+                    return 0
+                headers = ["Feature", "Type", "Unit", "Required", "Min", "Max"]
+                data = [
+                    [
+                        f.name,
+                        f.data_type,
+                        f.unit or "-",
+                        "yes" if f.is_required else "no",
+                        f.min_value if f.min_value is not None else "-",
+                        f.max_value if f.max_value is not None else "-",
+                    ]
+                    for f in spec.features
+                ]
+                print(tabulate(data, headers=headers, tablefmt="grid"))
+
+            elif args.spec_command == "delete":
+                try:
+                    SpecificationService.delete(session, args.name)
+                    print(f"Deleted specification: {args.name}")
+                except NotFoundError as e:
+                    print(f"Error: {e}")
+                    return 1
+
+            else:
+                print("Usage: buylog spec [create|add-feature|list|show|delete]")
+                return 1
+
+        elif args.command == "check":
+            from .notify import Notification, NotifyError
+            from .notify import send as send_notification
+            from .services import MonitorService
+
+            exit_code = 0
+
+            if args.refresh_fx:
+                from .services import ForexRefreshService
+
+                try:
+                    fx_stats = ForexRefreshService.refresh(session)
+                    print(
+                        f"Forex: updated {len(fx_stats['updated'])}, "
+                        f"skipped {len(fx_stats['skipped'])}"
+                    )
+                except ServiceError as e:
+                    print(f"Forex refresh failed: {e}")
+                    exit_code = 1
+
+            if args.refresh_scrapes:
+                from .services import ScrapeRefreshService
+
+                scrape_stats = ScrapeRefreshService.refresh(session)
+                print(
+                    f"Scrapes: checked {scrape_stats['checked']}, "
+                    f"changed {len(scrape_stats['changed'])}, "
+                    f"errors {len(scrape_stats['errors'])}"
+                )
+                for message in scrape_stats["errors"]:
+                    print(f"  {message}")
+                if scrape_stats["errors"]:
+                    exit_code = 1
+
+            findings = MonitorService.check(session)
+            messages = findings["messages"]
+
+            if not messages:
+                if not args.quiet:
+                    print("Nothing triggered.")
+                return exit_code
+
+            for message in messages:
+                print(message)
+
+            notification = Notification(
+                title=f"buylog: {len(messages)} price alert(s)",
+                body="\n".join(messages),
+                priority="high",
+                data={
+                    "alerts": [
+                        {
+                            "product": item["quote"].product.name,
+                            "vendor": item["quote"].vendor.name,
+                            "price": item["quote"].value,
+                            "threshold": item["alert"].threshold_value,
+                            "threshold_currency": item["alert"].threshold_currency,
+                        }
+                        for item in findings["alerts"]
+                    ],
+                    "watchlist": [
+                        {
+                            "product": item["quote"].product.name,
+                            "vendor": item["quote"].vendor.name,
+                            "price": item["quote"].value,
+                            "target": item["watchlist"].target_price,
+                        }
+                        for item in findings["watchlist"]
+                    ],
+                },
+            )
+
+            channels = args.notify
+            # stdout would repeat what was printed above, so drop it unless the
+            # user asked for it explicitly.
+            if channels is None and os.getenv("BUYLOG_NOTIFY") is None:
+                return exit_code
+
+            try:
+                delivered, failures = send_notification(notification, channels)
+            except NotifyError as e:
+                print(f"Notification failed: {e}")
+                return 1
+
+            if delivered:
+                print(f"Notified via: {', '.join(delivered)}")
+            for failure in failures:
+                print(f"Notification failed via {failure}")
+            if failures:
+                # A partially-delivered notification must not look like success,
+                # or a cron job silently loses those alerts forever.
+                return 1
+
+            return exit_code
+
+        elif args.command == "fx":
+            from .services import ForexRefreshService
+
+            if args.fx_command == "refresh":
+                try:
+                    date = _parse_date(getattr(args, "date", None))
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    return 1
+                try:
+                    stats = ForexRefreshService.refresh(
+                        session, codes=args.codes or None, date=date
+                    )
+                except ServiceError as e:
+                    print(f"Error: {e}")
+                    return 1
+
+                if not stats["updated"] and not stats["skipped"]:
+                    print(
+                        "Nothing to refresh: no currency codes given and no "
+                        "non-USD vendor currencies on file."
+                    )
+                    return 0
+
+                for code in stats["updated"]:
+                    print(f"  {code}: {stats['rates'][code]:.6f} USD per unit")
+                print(
+                    f"Updated {len(stats['updated'])} rate(s)"
+                    + (
+                        f", skipped {len(stats['skipped'])} "
+                        f"({', '.join(stats['skipped'])})"
+                        if stats["skipped"]
+                        else ""
+                    )
+                )
+
+            elif args.fx_command == "list":
+                list_entities(session, "forex", limit=args.limit)
+
+            else:
+                print("Usage: buylog fx [refresh|list]")
+                return 1
+
+        elif args.command == "spend":
+            from .services import SpendAnalyticsService
+
+            try:
+                start = _parse_date(getattr(args, "start", None))
+                end = _parse_date(getattr(args, "end", None))
+            except ValueError as e:
+                print(f"Error: {e}")
+                return 1
+
+            def money(value: float) -> str:
+                return f"${value:,.2f}"
+
+            if args.report in ("summary", "month"):
+                spend_rows = SpendAnalyticsService.spend_by_month(session, start, end)
+                if spend_rows:
+                    print("Spend by month")
+                    print(
+                        tabulate(
+                            [
+                                [r["period"], r["orders"], money(r["total"])]
+                                for r in spend_rows
+                            ],
+                            headers=["Month", "Orders", "Total (USD)"],
+                            tablefmt="grid",
+                        )
+                    )
+                elif args.report == "month":
+                    print("No purchase orders found")
+
+            if args.report in ("summary", "vendor"):
+                spend_rows = SpendAnalyticsService.spend_by_vendor(session, start, end)
+                if spend_rows:
+                    print("\nSpend by vendor")
+                    print(
+                        tabulate(
+                            [
+                                [r["vendor"], r["orders"], money(r["total"])]
+                                for r in spend_rows
+                            ],
+                            headers=["Vendor", "Orders", "Total (USD)"],
+                            tablefmt="grid",
+                        )
+                    )
+                elif args.report == "vendor":
+                    print("No purchase orders found")
+
+            if args.report in ("summary", "category"):
+                spend_rows = SpendAnalyticsService.spend_by_category(
+                    session, start, end
+                )
+                if spend_rows:
+                    print("\nSpend by category")
+                    print(
+                        tabulate(
+                            [
+                                [r["category"], r["orders"], money(r["total"])]
+                                for r in spend_rows
+                            ],
+                            headers=["Category", "Orders", "Total (USD)"],
+                            tablefmt="grid",
+                        )
+                    )
+                elif args.report == "category":
+                    print("No purchase orders found")
+
+            if args.report in ("summary", "variance"):
+                spend_rows = SpendAnalyticsService.price_variance(session, start, end)
+                if spend_rows:
+                    print("\nPaid vs. best recorded price")
+                    print(
+                        tabulate(
+                            [
+                                [
+                                    r["po_number"],
+                                    r["product"],
+                                    r["vendor"],
+                                    money(r["unit_paid"]),
+                                    f"{money(r['best_price'])} ({r['best_vendor']})",
+                                    f"{r['delta']:+,.2f} ({r['delta_pct']:+.1f}%)",
+                                ]
+                                for r in spend_rows
+                            ],
+                            headers=[
+                                "PO",
+                                "Product",
+                                "Vendor",
+                                "Unit Paid",
+                                "Best Recorded",
+                                "Delta",
+                            ],
+                            tablefmt="grid",
+                        )
+                    )
+                elif args.report == "variance":
+                    print("No purchase orders with comparable quotes found")
+
+            if args.report == "summary":
+                totals = SpendAnalyticsService.summary(session, start, end)
+                if not totals["orders"]:
+                    print("No purchase orders found")
+                    return 0
+                print(
+                    f"\n{totals['orders']} order(s), "
+                    f"{money(totals['total'])} total, "
+                    f"{money(totals['average'])} average"
+                )
 
         elif args.command == "import":
             from .excel import IMPORTERS
@@ -1775,12 +2623,12 @@ def main():
                     if not table:
                         print("Error: --table is required for Excel import")
                         print("Usage: buylog import -t <table> file.xlsx")
-                        return
+                        return 1
 
                     importer = IMPORTERS.get(table)
                     if not importer:
                         print(f"Error: Unknown table: {table}")
-                        return
+                        return 1
 
                     success, errors = importer(session, filepath)
                     print(f"Import complete: {success} rows imported")
@@ -1822,8 +2670,10 @@ def main():
 
             except FileNotFoundError:
                 print(f"Error: File not found: {filepath}")
+                return 1
             except Exception as e:
                 print(f"Error: {e}")
+                return 1
 
         elif args.command == "export":
             from .excel import (
@@ -1879,22 +2729,24 @@ def main():
                             print(f"Exported {count} rows to: {filepath}")
                         else:
                             print(f"Error: Unknown table: {table}")
+                            return 1
                 else:
                     # CSV export (legacy support)
                     from .services import ExportService
 
                     if table == "quotes":
-                        result = ExportService.export_quotes_csv(session, filepath)
+                        ExportService.export_quotes_csv(session, filepath)
                     elif table == "products":
-                        result = ExportService.export_products_csv(session, filepath)
+                        ExportService.export_products_csv(session, filepath)
                     elif table == "vendors":
-                        result = ExportService.export_vendors_csv(session, filepath)
+                        ExportService.export_vendors_csv(session, filepath)
                     else:
                         print("CSV export only supports: quotes, products, vendors")
-                        return
+                        return 1
                     print(f"Exported to: {filepath}")
             except Exception as e:
                 print(f"Error: {e}")
+                return 1
 
         elif args.command == "backup":
             from .services import BackupService
@@ -1908,9 +2760,10 @@ def main():
                 print(f"Backup created: {backup_path}")
             except Exception as e:
                 print(f"Error: {e}")
+                return 1
 
         elif args.command == "restore":
-            from .services import BackupService, NotFoundError
+            from .services import BackupService
             from .config import Config
 
             backup_file = args.backup_file
@@ -1925,9 +2778,10 @@ def main():
                     print("(Previous database was backed up)")
             except NotFoundError as e:
                 print(f"Error: {e}")
+                return 1
             except Exception as e:
                 print(f"Error: {e}")
-            return  # Exit after restore
+            return 0  # Exit after restore
 
         elif args.command == "backups":
             from .services import BackupService
@@ -1945,7 +2799,7 @@ def main():
                     print(f"  {b['name']} ({size_kb:.1f} KB) - {b['modified']}")
 
         elif args.command == "duplicates":
-            from .services import DeduplicationService, NotFoundError
+            from .services import DeduplicationService
 
             if args.duplicates_command == "vendors":
                 threshold = getattr(args, "threshold", 0.8)
@@ -1965,16 +2819,18 @@ def main():
 
             elif args.duplicates_command == "products":
                 threshold = getattr(args, "threshold", 0.8)
-                groups = DeduplicationService.find_similar_products(session, threshold)
+                product_groups = DeduplicationService.find_similar_products(
+                    session, threshold
+                )
 
-                if not groups:
+                if not product_groups:
                     print("No similar products found")
                 else:
-                    print(f"Found {len(groups)} groups of similar products:")
-                    for i, group in enumerate(groups, 1):
+                    print(f"Found {len(product_groups)} groups of similar products:")
+                    for i, product_group in enumerate(product_groups, 1):
                         print(f"\nGroup {i}:")
-                        for p in group:
-                            print(f"  [{p.id}] {p.name} ({p.brand.name})")
+                        for prod in product_group:
+                            print(f"  [{prod.id}] {prod.name} ({prod.brand.name})")
                     print(
                         "\nTo merge: buylog duplicates merge-products <keep_id> <merge_id1> <merge_id2> ..."
                     )
@@ -1987,6 +2843,7 @@ def main():
                     print(f"Merged vendors into: [{vendor.id}] {vendor.name}")
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.duplicates_command == "merge-products":
                 try:
@@ -1996,14 +2853,16 @@ def main():
                     print(f"Merged products into: [{product.id}] {product.name}")
                 except NotFoundError as e:
                     print(f"Error: {e}")
+                    return 1
 
             else:
                 print(
                     "Usage: buylog duplicates [vendors|products|merge-vendors|merge-products]"
                 )
+                return 1
 
         elif args.command == "clipboard":
-            from .services import ClipboardService, NotFoundError, ServiceError
+            from .services import ClipboardService
 
             if args.clipboard_command == "quote":
                 try:
@@ -2012,6 +2871,7 @@ def main():
                     print(text)
                 except (NotFoundError, ServiceError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.clipboard_command == "product":
                 try:
@@ -2020,6 +2880,7 @@ def main():
                     print(text)
                 except (NotFoundError, ServiceError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.clipboard_command == "vendor":
                 try:
@@ -2028,16 +2889,15 @@ def main():
                     print(text)
                 except (NotFoundError, ServiceError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             else:
                 print("Usage: buylog clipboard [quote|product|vendor]")
+                return 1
 
         elif args.command == "vendor-url":
             from .services import (
                 VendorURLService,
-                NotFoundError,
-                ValidationError,
-                ServiceError,
             )
 
             if args.vendor_url_command == "set":
@@ -2046,6 +2906,7 @@ def main():
                     print(f"Set URL for '{args.vendor}': {args.url}")
                 except (NotFoundError, ValidationError, ServiceError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.vendor_url_command == "open":
                 try:
@@ -2053,6 +2914,7 @@ def main():
                     print(f"Opening URL: {url}")
                 except (NotFoundError, ValidationError, ServiceError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.vendor_url_command == "clear":
                 try:
@@ -2060,16 +2922,15 @@ def main():
                     print(f"Cleared URL for '{args.vendor}'")
                 except (NotFoundError, ServiceError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             else:
                 print("Usage: buylog vendor-url [set|open|clear]")
+                return 1
 
         elif args.command == "receipt":
             from .services import (
                 ReceiptService,
-                NotFoundError,
-                ValidationError,
-                ServiceError,
             )
 
             if args.receipt_command == "attach":
@@ -2082,6 +2943,7 @@ def main():
                     )
                 except (NotFoundError, ServiceError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.receipt_command == "open":
                 try:
@@ -2089,6 +2951,7 @@ def main():
                     print(f"Opening receipt: {path}")
                 except (NotFoundError, ValidationError, ServiceError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.receipt_command == "detach":
                 try:
@@ -2096,6 +2959,7 @@ def main():
                     print(f"Detached receipt from quote #{args.quote_id}")
                 except (NotFoundError, ServiceError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.receipt_command == "list":
                 quotes = ReceiptService.get_quotes_with_receipts(session)
@@ -2118,13 +2982,11 @@ def main():
 
             else:
                 print("Usage: buylog receipt [attach|open|detach|list]")
+                return 1
 
         elif args.command == "scrape":
             from .services import (
                 ScraperService,
-                NotFoundError,
-                ValidationError,
-                ServiceError,
             )
 
             if args.scrape_command == "url":
@@ -2140,6 +3002,7 @@ def main():
                         print("  Could not extract price from page")
                 except (ValidationError, ServiceError) as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.scrape_command == "quote":
                 try:
@@ -2156,66 +3019,148 @@ def main():
                     print(f"  Price: ${quote.value:.2f}")
                 except (NotFoundError, ValidationError, ServiceError) as e:
                     print(f"Error: {e}")
+                    return 1
+
+            elif args.scrape_command == "refresh":
+                from .services import ScrapeRefreshService
+
+                if args.list_tracked:
+                    tracked = ScrapeRefreshService.tracked_quotes(session)
+                    if not tracked:
+                        print("No quotes carry a source URL to re-scrape.")
+                        return 0
+                    print(
+                        tabulate(
+                            [
+                                [
+                                    q.id,
+                                    q.product.name,
+                                    q.vendor.name,
+                                    f"${q.value:.2f}",
+                                    q.source_url,
+                                ]
+                                for q in tracked
+                            ],
+                            headers=["ID", "Product", "Vendor", "Price", "URL"],
+                            tablefmt="grid",
+                        )
+                    )
+                    return 0
+
+                stats = ScrapeRefreshService.refresh(
+                    session, quote_ids=getattr(args, "quote_ids", None)
+                )
+                if not stats["checked"]:
+                    print("No quotes carry a source URL to re-scrape.")
+                    return 0
+
+                for change in stats["changed"]:
+                    direction = (
+                        "down" if change["new_value"] < change["old_value"] else "up"
+                    )
+                    print(
+                        f"  #{change['quote_id']} {change['product']} at "
+                        f"{change['vendor']}: ${change['old_value']:.2f} -> "
+                        f"${change['new_value']:.2f} ({direction})"
+                    )
+                for message in stats["errors"]:
+                    print(f"  Error: {message}")
+
+                print(
+                    f"Checked {stats['checked']}, changed {len(stats['changed'])}, "
+                    f"unchanged {stats['unchanged']}, errors {len(stats['errors'])}"
+                )
+                if stats["errors"]:
+                    return 1
 
             else:
-                print("Usage: buylog scrape [url|quote]")
+                print("Usage: buylog scrape [url|quote|refresh]")
+                return 1
 
         elif args.command == "report":
-            from .services import ReportService, ValidationError
+            from .services import ReportService
 
             output_file = getattr(args, "output", None)
 
             if args.report_command == "price-comparison":
                 try:
                     filter_term = getattr(args, "filter", None)
-                    result = ReportService.generate_report(
+                    report = ReportService.generate_report(
                         session,
                         "price-comparison",
                         output_file,
                         filter_term=filter_term,
                     )
                     if output_file:
-                        print(f"Generated price comparison report: {result}")
+                        print(f"Generated price comparison report: {report}")
                     else:
-                        print(result)
+                        print(report)
                 except ValidationError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.report_command == "purchase-summary":
                 try:
-                    result = ReportService.generate_report(
+                    report = ReportService.generate_report(
                         session,
                         "purchase-summary",
                         output_file,
                     )
                     if output_file:
-                        print(f"Generated purchase summary report: {result}")
+                        print(f"Generated purchase summary report: {report}")
                     else:
-                        print(result)
+                        print(report)
                 except ValidationError as e:
                     print(f"Error: {e}")
+                    return 1
 
             elif args.report_command == "vendor-analysis":
                 try:
-                    result = ReportService.generate_report(
+                    report = ReportService.generate_report(
                         session,
                         "vendor-analysis",
                         output_file,
                     )
                     if output_file:
-                        print(f"Generated vendor analysis report: {result}")
+                        print(f"Generated vendor analysis report: {report}")
                     else:
-                        print(result)
+                        print(report)
                 except ValidationError as e:
                     print(f"Error: {e}")
+                    return 1
+
+            elif args.report_command == "spend-analysis":
+                try:
+                    start = _parse_date(getattr(args, "start", None))
+                    end = _parse_date(getattr(args, "end", None))
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    return 1
+                try:
+                    report = ReportService.generate_report(
+                        session,
+                        "spend-analysis",
+                        output_file,
+                        start=start,
+                        end=end,
+                    )
+                    if output_file:
+                        print(f"Generated spend analysis report: {report}")
+                    else:
+                        print(report)
+                except ValidationError as e:
+                    print(f"Error: {e}")
+                    return 1
 
             else:
                 print(
-                    "Usage: buylog report [price-comparison|purchase-summary|vendor-analysis]"
+                    "Usage: buylog report [price-comparison|purchase-summary"
+                    "|vendor-analysis|spend-analysis]"
                 )
+                return 1
 
         elif args.command == "migrate":
-            from .migrate import run_migrations, check_migrations
+            from .migrate import MigrationError, run_migrations, check_migrations
 
             if args.dry_run:
                 migrations = check_migrations(engine)
@@ -2226,7 +3171,11 @@ def main():
                     for sql in migrations:
                         print(f"  {sql};\n")
             else:
-                migrations = run_migrations(engine)
+                try:
+                    migrations = run_migrations(engine)
+                except MigrationError as e:
+                    print(f"Migration failed: {e}")
+                    return 1
                 if not migrations:
                     print("Database schema is up to date.")
                 else:
@@ -2262,7 +3211,7 @@ def main():
                 generator = TEMPLATE_GENERATORS.get(table)
                 if not generator:
                     print(f"Error: Unknown table type: {table}")
-                    return
+                    return 1
 
                 if not filepath.endswith(".xlsx"):
                     filepath += ".xlsx"
@@ -2276,6 +3225,7 @@ def main():
                     print(f"Generated template: {filepath}")
                 except Exception as e:
                     print(f"Error: {e}")
+                    return 1
 
             else:
                 # YAML/JSON template generation
@@ -2296,8 +3246,9 @@ def main():
                     print(
                         f"Error: {fmt.upper()} templates only available for: vendors, specifications, purchase_orders"
                     )
+                    return 1
                     print(f"Use -f xlsx for {table} templates")
-                    return
+                    return 1
 
                 try:
                     output = yaml_generators[table]()
@@ -2305,6 +3256,7 @@ def main():
                     print(f"Generated template: {filepath}")
                 except Exception as e:
                     print(f"Error: {e}")
+                    return 1
 
     except IntegrityError as e:
         session.rollback()
@@ -2313,25 +3265,37 @@ def main():
             print("Error: Duplicate entry. Please use a unique name.")
         else:
             print(f"Error: Database constraint violation: {e}")
+        return 1
     except SQLAlchemyError as e:
         session.rollback()
         logger.error(f"Database error: {e}")
         print(f"Error: Database error occurred: {e}")
+        return 1
+    except ServiceError as e:
+        session.rollback()
+        logger.error(f"Service error: {e}")
+        print(f"Error: {e}")
+        return 1
     except ValueError as e:
         session.rollback()
         logger.warning(f"Invalid input: {e}")
         print(f"Error: Invalid input - {e}")
+        return 1
     except KeyboardInterrupt:
         logger.info("Operation cancelled by user")
         print("\nOperation cancelled by user.")
         session.rollback()
+        return 130
     except Exception as e:
         session.rollback()
         logger.exception(f"Unexpected error: {e}")
         print(f"Error: Unexpected error occurred: {e}")
+        return 1
     finally:
         session.close()
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

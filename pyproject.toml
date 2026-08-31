@@ -65,12 +65,17 @@ dev = [
     "mypy>=1.19.1",
     "py-pglite[sqlalchemy]>=0.5.3",
     "pytest>=8.3.5",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.1.0",
     "ruff>=0.14.13",
     "twine>=6.2.0",
     "types-pyyaml>=6.0.12.20250915",
 ]
 
 [tool.pytest.ini_options]
+# The TUI tests drive Textual's async test pilot.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
     # SQLAlchemy uses deprecated utcnow() internally - upstream issue
     "ignore:datetime.datetime.utcnow:DeprecationWarning",

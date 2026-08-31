@@ -24,6 +24,7 @@ from rich.text import Text
 from .config import Config
 from .models import (
     Base,
+    init_db,
     Brand,
     Product,
     Vendor,
@@ -45,6 +46,7 @@ from .services import (
     WatchlistService,
     SpecificationService,
     PurchaseOrderService,
+    ForexService,
     DuplicateError,
     ValidationError,
     NotFoundError,
@@ -81,7 +83,7 @@ def make_sparkline(values: list[float], width: int = 7) -> str:
 
 # Database setup
 engine = Config.get_engine()
-Base.metadata.create_all(engine)
+init_db(engine)
 Session = Config.get_session_maker()
 
 
@@ -1457,7 +1459,15 @@ class BuyerApp(App):
 
         quotes_table = self.query_one("#quotes-table", DataTable)
         quotes_table.add_columns(
-            "ID", "Vendor", "Product", "Price", "Total", "Status", "Trend", "Spark"
+            "ID",
+            "Vendor",
+            "Product",
+            "Price",
+            "As Entered",
+            "Total",
+            "Status",
+            "Trend",
+            "Spark",
         )
         quotes_table.cursor_type = "row"
 
@@ -1622,6 +1632,7 @@ class BuyerApp(App):
                     "product": product_name,
                     "price": q.value,
                     "price_text": price_text,
+                    "source_price": q.source_price,
                     "total": q.total_cost,
                     "total_str": total_str,
                     "status": q.status or "",
@@ -1639,6 +1650,7 @@ class BuyerApp(App):
                 "vendor",
                 "product",
                 "price",
+                "source_price",
                 "total",
                 "status",
                 "trend",
@@ -1661,6 +1673,7 @@ class BuyerApp(App):
                 row["vendor"],
                 row["product"],
                 row["price_text"],
+                row["source_price"],
                 row["total_str"],
                 row["status_text"],
                 row["trend"],
@@ -1953,24 +1966,20 @@ class BuyerApp(App):
         if result:
             brand_name, product_name = result
             try:
-                brand = Brand.by_name(self.session, brand_name)
-                if not brand:
-                    brand = BrandService.create(self.session, brand_name)
+                if not Brand.by_name(self.session, brand_name):
+                    BrandService.create(self.session, brand_name)
                     self.notify(f"Created brand: {brand_name}")
 
-                existing = Product.by_name(self.session, product_name)
-                if existing:
-                    self.notify(
-                        f"Product '{product_name}' already exists", severity="warning"
-                    )
-                    return
-
-                product = Product(name=product_name, brand=brand)
-                self.session.add(product)
-                self.session.commit()
+                ProductService.create(self.session, product_name, brand_name)
                 self.notify(f"Added product: {product_name}")
                 self._refresh_products()
                 self._refresh_brands()
+            except DuplicateError:
+                self.notify(
+                    f"Product '{product_name}' already exists", severity="warning"
+                )
+            except (ValidationError, NotFoundError) as e:
+                self.notify(str(e), severity="error")
             except Exception as e:
                 self.session.rollback()
                 self.notify(str(e), severity="error")
@@ -1981,56 +1990,17 @@ class BuyerApp(App):
         if result:
             vendor_name, product_name, brand_name, price = result
             try:
-                vendor = Vendor.by_name(self.session, vendor_name)
-                if not vendor:
-                    self.notify(f"Vendor '{vendor_name}' not found", severity="error")
-                    return
-
-                product = Product.by_name(self.session, product_name)
-                if not product:
-                    if not brand_name:
-                        self.notify(
-                            "Product not found. Provide brand name for new product.",
-                            severity="error",
-                        )
-                        return
-                    brand = Brand.by_name(self.session, brand_name)
-                    if not brand:
-                        brand = BrandService.create(self.session, brand_name)
-                    product = Product(name=product_name, brand=brand)
-                    self.session.add(product)
-                    self.session.commit()
-
-                value = price
-                original_value = None
-                original_currency = None
-
-                if vendor.currency != "USD":
-                    fx_rate = self.session.execute(
-                        select(Forex).where(Forex.code == vendor.currency)
-                    ).scalar_one_or_none()
-                    if not fx_rate:
-                        self.notify(
-                            f"Forex rate for '{vendor.currency}' not found",
-                            severity="error",
-                        )
-                        return
-                    original_value = value
-                    original_currency = vendor.currency
-                    value = value * fx_rate.usd_per_unit
-
-                quote = Quote(
-                    vendor=vendor,
-                    product=product,
-                    currency="USD",
-                    value=value,
-                    original_value=original_value,
-                    original_currency=original_currency,
+                QuoteService.create(
+                    self.session,
+                    vendor_name=vendor_name,
+                    product_name=product_name,
+                    price=price,
+                    brand_name=brand_name,
                 )
-                self.session.add(quote)
-                self.session.commit()
                 self.notify(f"Added quote: {vendor_name} -> {product_name} = {price}")
                 self._refresh_quotes()
+            except (ValidationError, NotFoundError) as e:
+                self.notify(str(e), severity="error")
             except Exception as e:
                 self.session.rollback()
                 self.notify(str(e), severity="error")
@@ -2046,21 +2016,16 @@ class BuyerApp(App):
                 else:
                     date = datetime.date.today()
 
-                existing = self.session.execute(
-                    select(Forex).where(Forex.code == code, Forex.date == date)
-                ).scalar_one_or_none()
-                if existing:
-                    self.notify(
-                        f"Forex rate for '{code}' on {date} already exists",
-                        severity="warning",
-                    )
-                    return
-
-                fx = Forex(code=code, usd_per_unit=rate, date=date)
-                self.session.add(fx)
-                self.session.commit()
+                ForexService.create(self.session, code, rate, date=date)
                 self.notify(f"Added forex rate: {code} = {rate}")
                 self._refresh_forex()
+            except DuplicateError:
+                self.notify(
+                    f"Forex rate for '{code}' on {date} already exists",
+                    severity="warning",
+                )
+            except ValidationError as e:
+                self.notify(str(e), severity="error")
             except ValueError:
                 self.notify("Invalid date format. Use YYYY-MM-DD", severity="error")
             except Exception as e:
@@ -2162,10 +2127,24 @@ class BuyerApp(App):
                 entity = self.session.get(Watchlist, entity_id)
 
             if entity:
-                self.session.delete(entity)
-                self.session.commit()
+                # Named entities go through their service so dependent rows
+                # (price history, alerts, watchlist entries) go with them.
+                deleters = {
+                    "brand": BrandService.delete,
+                    "product": ProductService.delete,
+                    "vendor": VendorService.delete,
+                }
+                if isinstance(entity, (Brand, Product, Vendor)):
+                    deleters[entity_type](self.session, entity.name)
+                elif entity_type == "quote":
+                    QuoteService.delete(self.session, entity_id)
+                else:
+                    self.session.delete(entity)
+                    self.session.commit()
                 self.notify(f"Deleted {entity_type}")
                 self._refresh_all()
+        except (ValidationError, NotFoundError) as e:
+            self.notify(str(e), severity="error")
         except Exception as e:
             self.session.rollback()
             self.notify(str(e), severity="error")
@@ -2313,10 +2292,11 @@ class BuyerApp(App):
             try:
                 brand = self.session.get(Brand, entity_id)
                 if brand:
-                    brand.name = new_value
-                    self.session.commit()
+                    BrandService.update(self.session, brand.name, new_value)
                     self.notify(f"Updated brand to: {new_value}")
                     self._refresh_brands()
+            except (ValidationError, DuplicateError, NotFoundError) as e:
+                self.notify(str(e), severity="error")
             except Exception as e:
                 self.session.rollback()
                 self.notify(str(e), severity="error")
@@ -2329,10 +2309,11 @@ class BuyerApp(App):
             try:
                 product = self.session.get(Product, entity_id)
                 if product:
-                    product.name = new_value
-                    self.session.commit()
+                    ProductService.update(self.session, product.name, new_value)
                     self.notify(f"Updated product to: {new_value}")
                     self._refresh_products()
+            except (ValidationError, DuplicateError, NotFoundError) as e:
+                self.notify(str(e), severity="error")
             except Exception as e:
                 self.session.rollback()
                 self.notify(str(e), severity="error")
@@ -2343,10 +2324,11 @@ class BuyerApp(App):
             try:
                 vendor = self.session.get(Vendor, entity_id)
                 if vendor:
-                    vendor.name = new_value
-                    self.session.commit()
+                    VendorService.update(self.session, vendor.name, new_value)
                     self.notify(f"Updated vendor to: {new_value}")
                     self._refresh_vendors()
+            except (ValidationError, DuplicateError, NotFoundError) as e:
+                self.notify(str(e), severity="error")
             except Exception as e:
                 self.session.rollback()
                 self.notify(str(e), severity="error")

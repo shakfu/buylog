@@ -8,6 +8,10 @@ wheels/
 *.egg-info
 .*_cache
 
+# coverage (make coverage)
+.coverage
+cov_html/
+
 # Virtual environments
 .venv
 venv
@@ -18,4 +22,4 @@ uv.lock
 # claude
 .claude
 CLAUDE.md
-
+REVIEW.md

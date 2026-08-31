@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     Table,
+    UniqueConstraint,
     create_engine,
 )
 from sqlalchemy import select
@@ -50,7 +51,12 @@ class Forex(Base):
     """Table of forex rates - tracks currency exchange rates over time"""
 
     __tablename__ = "forex"
-    __table_args__ = ({"sqlite_autoincrement": True},)
+    __table_args__ = (
+        # One rate per currency per day; without this, code-only lookups can
+        # match several rows.
+        UniqueConstraint("code", "date", name="uq_forex_code_date"),
+        {"sqlite_autoincrement": True},
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     date: Mapped[datetime.date] = mapped_column(
@@ -104,7 +110,9 @@ class Vendor(Object, Base):
     brands: Mapped[List["Brand"]] = relationship(
         secondary=VendorBrand, back_populates="vendors"
     )
-    quotes: Mapped[List["Quote"]] = relationship(back_populates="vendor")
+    quotes: Mapped[List["Quote"]] = relationship(
+        back_populates="vendor", cascade="all, delete-orphan"
+    )
 
     def add_product(self, session, brand_name, product_name, price, discount=0.0):
         _brand = session.execute(
@@ -140,6 +148,9 @@ class Brand(Object, Base):
     vendors: Mapped[List["Vendor"]] = relationship(
         "Vendor", secondary=VendorBrand, back_populates="brands"
     )
+    # Deliberately NOT cascading: a brand's products are independently
+    # meaningful records, and cascading would chain on through Product.quotes
+    # and wipe the catalogue. BrandService.delete refuses instead.
     products: Mapped[List["Product"]] = relationship("Product", back_populates="brand")
 
 
@@ -233,9 +244,17 @@ class Product(Object, Base):
     specification: Mapped["Specification | None"] = relationship(
         "Specification", back_populates="products"
     )
-    quotes: Mapped[List["Quote"]] = relationship("Quote", back_populates="product")
+    quotes: Mapped[List["Quote"]] = relationship(
+        "Quote", back_populates="product", cascade="all, delete-orphan"
+    )
     features: Mapped[List["ProductFeature"]] = relationship(
         "ProductFeature", back_populates="product", cascade="all, delete-orphan"
+    )
+    price_alerts: Mapped[List["PriceAlert"]] = relationship(
+        "PriceAlert", back_populates="product", cascade="all, delete-orphan"
+    )
+    watchlist_entries: Mapped[List["Watchlist"]] = relationship(
+        "Watchlist", back_populates="product", cascade="all, delete-orphan"
     )
 
 
@@ -254,18 +273,48 @@ class Quote(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     product_id: Mapped[int] = mapped_column(Integer, ForeignKey("product.id"))
     product: Mapped["Product"] = relationship("Product", back_populates="quotes")
+    history: Mapped[List["QuoteHistory"]] = relationship(
+        "QuoteHistory",
+        back_populates="quote",
+        cascade="all, delete-orphan",
+    )
     vendor_id: Mapped[int] = mapped_column(Integer, ForeignKey("vendor.id"))
     vendor: Mapped["Vendor"] = relationship("Vendor", back_populates="quotes")
     currency: Mapped[str] = mapped_column(String, default="USD")
     value: Mapped[float] = mapped_column(Float)
-    original_value: Mapped[float] = mapped_column(Float, nullable=True)
-    original_currency: Mapped[str] = mapped_column(String, nullable=True)
+    original_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    original_currency: Mapped[str | None] = mapped_column(String, nullable=True)
     discount: Mapped[float] = mapped_column(Float, default=0.0)
     shipping_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
     tax_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now())
     status: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     receipt_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The product page this quote's price came from, so it can be re-scraped.
+    source_url: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    @property
+    def source_price(self) -> str:
+        """
+        The price as the user entered it, e.g. ``"\u20ac999.00"`` or ``"$999.00"``.
+
+        Quotes are normalized to USD at entry, but a user who thinks in EUR
+        needs to see what they actually typed.
+        """
+        if self.original_value is None or not self.original_currency:
+            return f"{self.value:,.2f} USD"
+        return f"{self.original_value:,.2f} {self.original_currency}"
+
+    @property
+    def display_price(self) -> str:
+        """
+        The price with its source currency, e.g. ``"999.00 EUR (= $1,085.00)"``.
+
+        Falls back to plain USD when the quote was entered in USD.
+        """
+        if self.original_value is None or not self.original_currency:
+            return f"${self.value:,.2f}"
+        return f"{self.original_value:,.2f} {self.original_currency} (= ${self.value:,.2f})"
 
     @property
     def total_cost(self) -> float:
@@ -286,7 +335,7 @@ class QuoteHistory(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     quote_id: Mapped[int] = mapped_column(ForeignKey("quote.id"), index=True)
-    quote: Mapped["Quote"] = relationship("Quote")
+    quote: Mapped["Quote"] = relationship("Quote", back_populates="history")
     old_value: Mapped[float | None] = mapped_column(Float, nullable=True)
     new_value: Mapped[float] = mapped_column(Float)
     changed_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now())
@@ -344,6 +393,9 @@ class PurchaseOrder(Base):
     shipping_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
     tax: Mapped[float | None] = mapped_column(Float, nullable=True)
     grand_total: Mapped[float] = mapped_column(Float)  # total + shipping + tax
+    # grand_total normalized to USD, so orders in different vendor currencies
+    # can be compared and summed.
+    grand_total_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     invoice_number: Mapped[str | None] = mapped_column(String, nullable=True)
     notes: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -360,7 +412,7 @@ class PriceAlert(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("product.id"), index=True)
-    product: Mapped["Product"] = relationship("Product")
+    product: Mapped["Product"] = relationship("Product", back_populates="price_alerts")
     threshold_value: Mapped[float] = mapped_column(Float)
     threshold_currency: Mapped[str] = mapped_column(String, default="USD")
     active: Mapped[int] = mapped_column(Integer, default=1)  # SQLite bool
@@ -473,7 +525,9 @@ class Watchlist(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("product.id"), index=True)
-    product: Mapped["Product"] = relationship("Product")
+    product: Mapped["Product"] = relationship(
+        "Product", back_populates="watchlist_entries"
+    )
     target_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     notes: Mapped[str | None] = mapped_column(String, nullable=True)
     active: Mapped[int] = mapped_column(Integer, default=1)
@@ -481,6 +535,20 @@ class Watchlist(Base):
 
     def __repr__(self):
         return f"<Watchlist(product={self.product.name}, target=${self.target_price})>"
+
+
+def init_db(engine) -> None:
+    """
+    Create every table registered on ``Base.metadata``.
+
+    Models defined outside this module (``audit.AuditLog``) only register
+    themselves on import, so import them here before creating tables.
+    Callers must use this instead of ``Base.metadata.create_all`` directly,
+    otherwise those tables are silently skipped.
+    """
+    from . import audit  # noqa: F401  (registers AuditLog on Base.metadata)
+
+    Base.metadata.create_all(engine)
 
 
 if __name__ == "__main__":

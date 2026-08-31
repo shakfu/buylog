@@ -114,7 +114,7 @@ class TestQuoteHistoryService:
         ProductService.create(dbsession, "iPhone 15", "Apple")
         quote = QuoteService.create(dbsession, "Amazon", "iPhone 15", 999.0)
 
-        QuoteHistoryService.record_change(dbsession, quote, None, 999.0, "create")
+        # create() already records the "create" entry
         QuoteHistoryService.record_change(dbsession, quote, 999.0, 899.0, "update")
 
         history = QuoteHistoryService.get_history(dbsession, quote.id)
@@ -130,11 +130,9 @@ class TestQuoteHistoryService:
         VendorService.create(dbsession, "BestBuy", currency="USD")
         ProductService.create(dbsession, "iPhone 15", "Apple")
 
+        # create() records a "create" history entry for each quote
         quote1 = QuoteService.create(dbsession, "Amazon", "iPhone 15", 999.0)
-        quote2 = QuoteService.create(dbsession, "BestBuy", "iPhone 15", 1049.0)
-
-        QuoteHistoryService.record_change(dbsession, quote1, None, 999.0, "create")
-        QuoteHistoryService.record_change(dbsession, quote2, None, 1049.0, "create")
+        QuoteService.create(dbsession, "BestBuy", "iPhone 15", 1049.0)
 
         history = QuoteHistoryService.get_product_history(dbsession, quote1.product_id)
 
@@ -367,11 +365,12 @@ class TestQuoteServiceExtensions:
 
         assert updated.value == 899.0
 
-        # Check history was recorded
+        # Check history was recorded (newest first, after the "create" entry)
         history = QuoteHistoryService.get_history(dbsession, quote.id)
-        assert len(history) == 1
+        assert len(history) == 2
         assert history[0].old_value == 999.0
         assert history[0].new_value == 899.0
+        assert history[1].change_type == "create"
 
     def test_update_price_triggers_alert(self, dbsession):
         """Updating price triggers relevant alerts"""

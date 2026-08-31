@@ -9,11 +9,11 @@ test:
 
 coverage:
 	@echo "generating test coverage report"
-	@uv run pytest --cov-report=html:cov_html --cov-report=term-missing --cov=buylog buylog/tests
+	@uv run pytest --cov-report=html:cov_html --cov-report=term-missing --cov=buylog tests
 
 diagram:
 	@echo "generating entity-relation diagram to 'doc' folder"
-	@uv run python buylog/models.py
+	@uv run python scripts/gen_diagram.py
 
 lint:
 	@uv run ruff check --fix src/
