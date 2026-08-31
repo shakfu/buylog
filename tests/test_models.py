@@ -1,7 +1,7 @@
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from buylog.models import Base, Brand, Product, Vendor, Quote, Forex
+from buylog.models import Brand, Product, Vendor, Quote, Forex
 
 
 # Brand Tests
@@ -99,7 +99,9 @@ def test_product_unique_constraint(dbsession):
 # Vendor Tests
 def test_vendor_creation(dbsession):
     """Test vendor can be created with currency"""
-    vendor = Vendor(name="Amazon", currency="USD", discount_code="SAVE10", discount=10.0)
+    vendor = Vendor(
+        name="Amazon", currency="USD", discount_code="SAVE10", discount=10.0
+    )
     dbsession.add(vendor)
     dbsession.flush()
 
@@ -244,7 +246,9 @@ def test_specification_creation(dbsession):
     """Test specification can be created"""
     from buylog.models import Specification
 
-    spec = Specification(name="Camera Specs", description="Camera product specifications")
+    spec = Specification(
+        name="Camera Specs", description="Camera product specifications"
+    )
     dbsession.add(spec)
     dbsession.commit()
 
@@ -339,16 +343,30 @@ def test_product_feature_value_property(dbsession):
     brand = Brand(name="Test Brand")
     product = Product(name="Test Product", brand=brand, specification=spec)
 
-    text_feature = SpecificationFeature(specification=spec, name="Color", data_type="text")
-    number_feature = SpecificationFeature(specification=spec, name="Weight", data_type="number")
-    bool_feature = SpecificationFeature(specification=spec, name="Wireless", data_type="boolean")
+    text_feature = SpecificationFeature(
+        specification=spec, name="Color", data_type="text"
+    )
+    number_feature = SpecificationFeature(
+        specification=spec, name="Weight", data_type="number"
+    )
+    bool_feature = SpecificationFeature(
+        specification=spec, name="Wireless", data_type="boolean"
+    )
 
-    dbsession.add_all([spec, brand, product, text_feature, number_feature, bool_feature])
+    dbsession.add_all(
+        [spec, brand, product, text_feature, number_feature, bool_feature]
+    )
     dbsession.flush()
 
-    pf_text = ProductFeature(product=product, specification_feature=text_feature, value_text="Red")
-    pf_number = ProductFeature(product=product, specification_feature=number_feature, value_number=1.5)
-    pf_bool = ProductFeature(product=product, specification_feature=bool_feature, value_boolean=1)
+    pf_text = ProductFeature(
+        product=product, specification_feature=text_feature, value_text="Red"
+    )
+    pf_number = ProductFeature(
+        product=product, specification_feature=number_feature, value_number=1.5
+    )
+    pf_bool = ProductFeature(
+        product=product, specification_feature=bool_feature, value_boolean=1
+    )
 
     dbsession.add_all([pf_text, pf_number, pf_bool])
     dbsession.commit()
@@ -361,7 +379,6 @@ def test_product_feature_value_property(dbsession):
 # PurchaseOrder Tests
 def test_purchase_order_creation(dbsession):
     """Test purchase order can be created"""
-    import datetime
     from buylog.models import PurchaseOrder, PO_STATUS_PENDING
 
     brand = Brand(name="Apple")
@@ -399,7 +416,6 @@ def test_purchase_order_creation(dbsession):
 
 def test_purchase_order_with_quote(dbsession):
     """Test purchase order can reference a quote"""
-    import datetime
     from buylog.models import PurchaseOrder, PO_STATUS_ORDERED
 
     brand = Brand(name="Apple")
@@ -545,7 +561,6 @@ def test_quote_with_original_currency(dbsession):
 # Forex Tests
 def test_forex_creation(dbsession):
     """Test forex rate can be created"""
-    import datetime
 
     fx = Forex(code="EUR", usd_per_unit=1.085)
     dbsession.add(fx)
@@ -589,7 +604,9 @@ def test_forex_historical_rates(dbsession):
 
     # Same currency, different dates
     eur_today = Forex(code="EUR", usd_per_unit=1.085, date=datetime.date(2025, 10, 17))
-    eur_yesterday = Forex(code="EUR", usd_per_unit=1.080, date=datetime.date(2025, 10, 16))
+    eur_yesterday = Forex(
+        code="EUR", usd_per_unit=1.080, date=datetime.date(2025, 10, 16)
+    )
     dbsession.add_all([eur_today, eur_yesterday])
     dbsession.commit()
 
@@ -617,7 +634,9 @@ def test_full_workflow(dbsession):
     gbp = Forex(code="GBP", usd_per_unit=1.292)
 
     # Create vendors
-    acme_corp = Vendor(name="acme-corp", currency="USD", discount_code="abc123", discount=0.1)
+    acme_corp = Vendor(
+        name="acme-corp", currency="USD", discount_code="abc123", discount=0.1
+    )
     amazon = Vendor(name="amazon", currency="GBP")
 
     # Create brands

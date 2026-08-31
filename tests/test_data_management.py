@@ -1,34 +1,27 @@
 """Tests for data management features: import, export, backup, and deduplication."""
 
-import csv
-import io
 import json
 import os
 import tempfile
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
 
 from buylog.models import Brand, Product, Vendor, Quote
 from buylog.services import (
-    BrandService,
-    ProductService,
-    VendorService,
-    QuoteService,
     ImportService,
     ExportService,
     BackupService,
     DeduplicationService,
     NotFoundError,
     ValidationError,
-    ServiceError,
 )
 
 
 # =============================================================================
 # Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def brand(dbsession):
@@ -79,7 +72,7 @@ TestVendor1,TestProduct1,TestBrand1,99.99,USD,5.00,8.5
 TestVendor2,TestProduct2,TestBrand2,149.99,USD,,
 TestVendor1,TestProduct3,TestBrand1,49.99,USD,2.50,
 """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
         f.write(content)
         f.flush()
         yield f.name
@@ -90,10 +83,21 @@ TestVendor1,TestProduct3,TestBrand1,49.99,USD,2.50,
 def temp_json_file():
     """Create a temporary JSON file for import testing."""
     data = [
-        {"vendor": "JsonVendor1", "product": "JsonProduct1", "brand": "JsonBrand1", "price": 199.99},
-        {"vendor": "JsonVendor2", "product": "JsonProduct2", "brand": "JsonBrand2", "price": 299.99, "shipping": 10.00},
+        {
+            "vendor": "JsonVendor1",
+            "product": "JsonProduct1",
+            "brand": "JsonBrand1",
+            "price": 199.99,
+        },
+        {
+            "vendor": "JsonVendor2",
+            "product": "JsonProduct2",
+            "brand": "JsonBrand2",
+            "price": 299.99,
+            "shipping": 10.00,
+        },
     ]
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(data, f)
         f.flush()
         yield f.name
@@ -103,6 +107,7 @@ def temp_json_file():
 # =============================================================================
 # Import Service Tests
 # =============================================================================
+
 
 class TestImportService:
     """Tests for ImportService."""
@@ -118,7 +123,9 @@ class TestImportService:
 
     def test_import_csv_without_create(self, dbsession, temp_csv_file, vendor, product):
         """Test that import without create_missing raises errors."""
-        stats = ImportService.import_quotes_csv(dbsession, temp_csv_file, create_missing=False)
+        stats = ImportService.import_quotes_csv(
+            dbsession, temp_csv_file, create_missing=False
+        )
 
         # Should have errors because vendors/products don't exist
         assert stats["skipped"] > 0
@@ -143,7 +150,7 @@ class TestImportService:
 
     def test_import_invalid_json(self, dbsession):
         """Test that importing invalid JSON raises error."""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             f.write("not valid json")
             f.flush()
             try:
@@ -156,6 +163,7 @@ class TestImportService:
 # =============================================================================
 # Export Service Tests
 # =============================================================================
+
 
 class TestExportService:
     """Tests for ExportService."""
@@ -170,7 +178,7 @@ class TestExportService:
 
     def test_export_quotes_csv_to_file(self, dbsession, quote):
         """Test exporting quotes to CSV file."""
-        with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
             file_path = f.name
 
         try:
@@ -186,7 +194,9 @@ class TestExportService:
 
     def test_export_quotes_markdown(self, dbsession, quote):
         """Test exporting quotes to Markdown."""
-        md_content = ExportService.export_quotes_markdown(dbsession, title="Test Report")
+        md_content = ExportService.export_quotes_markdown(
+            dbsession, title="Test Report"
+        )
 
         assert "# Test Report" in md_content
         assert "| ID |" in md_content
@@ -194,11 +204,15 @@ class TestExportService:
 
     def test_export_quotes_with_filter(self, dbsession, quote):
         """Test exporting quotes with filter."""
-        csv_content = ExportService.export_quotes_csv(dbsession, filter_by="TestProduct")
+        csv_content = ExportService.export_quotes_csv(
+            dbsession, filter_by="TestProduct"
+        )
         assert "TestProduct" in csv_content
 
-        csv_content = ExportService.export_quotes_csv(dbsession, filter_by="NonexistentProduct")
-        lines = csv_content.strip().split('\n')
+        csv_content = ExportService.export_quotes_csv(
+            dbsession, filter_by="NonexistentProduct"
+        )
+        lines = csv_content.strip().split("\n")
         assert len(lines) == 1  # Only header
 
     def test_export_products_csv(self, dbsession, product):
@@ -220,12 +234,13 @@ class TestExportService:
 # Backup Service Tests
 # =============================================================================
 
+
 class TestBackupService:
     """Tests for BackupService."""
 
     def test_backup_creates_file(self):
         """Test that backup creates a file."""
-        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             # Write some content to simulate a database
             f.write(b"test database content")
             f.flush()
@@ -241,12 +256,12 @@ class TestBackupService:
 
     def test_backup_custom_path(self):
         """Test backup to custom path."""
-        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as db_f:
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as db_f:
             db_f.write(b"test content")
             db_f.flush()
             db_path = db_f.name
 
-        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as backup_f:
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as backup_f:
             backup_path = backup_f.name
 
         try:
@@ -264,12 +279,12 @@ class TestBackupService:
 
     def test_restore_from_backup(self):
         """Test restoring from backup."""
-        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as backup_f:
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as backup_f:
             backup_f.write(b"backup content")
             backup_f.flush()
             backup_path = backup_f.name
 
-        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as db_f:
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as db_f:
             db_f.write(b"original content")
             db_f.flush()
             db_path = db_f.name
@@ -277,7 +292,7 @@ class TestBackupService:
         try:
             BackupService.restore(backup_path, db_path, create_backup=False)
 
-            with open(db_path, 'rb') as f:
+            with open(db_path, "rb") as f:
                 content = f.read()
                 assert content == b"backup content"
         finally:
@@ -310,6 +325,7 @@ class TestBackupService:
 # =============================================================================
 # Deduplication Service Tests
 # =============================================================================
+
 
 class TestDeduplicationService:
     """Tests for DeduplicationService."""

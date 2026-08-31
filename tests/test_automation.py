@@ -302,15 +302,27 @@ def spending(dbsession):
     QuoteService.create(dbsession, "BestBuy", "MacBook", 2000.0)
 
     PurchaseOrderService.create(
-        dbsession, "PO-1", "Amazon", "iPhone 15", 1000.0,
+        dbsession,
+        "PO-1",
+        "Amazon",
+        "iPhone 15",
+        1000.0,
         order_date=datetime.date(2026, 1, 15),
     )
     PurchaseOrderService.create(
-        dbsession, "PO-2", "BestBuy", "MacBook", 2000.0,
+        dbsession,
+        "PO-2",
+        "BestBuy",
+        "MacBook",
+        2000.0,
         order_date=datetime.date(2026, 1, 20),
     )
     PurchaseOrderService.create(
-        dbsession, "PO-3", "Amazon", "iPhone 15", 800.0,
+        dbsession,
+        "PO-3",
+        "Amazon",
+        "iPhone 15",
+        800.0,
         order_date=datetime.date(2026, 2, 3),
     )
     return dbsession
@@ -377,7 +389,12 @@ def test_spend_uses_usd_totals_for_foreign_orders(dbsession):
     VendorService.create(dbsession, "EuroShop", currency="EUR")
     ProductService.create(dbsession, "TV", "Sony")
     PurchaseOrderService.create(
-        dbsession, "PO-EUR", "EuroShop", "TV", 100.0, quantity=2,
+        dbsession,
+        "PO-EUR",
+        "EuroShop",
+        "TV",
+        100.0,
+        quantity=2,
         order_date=datetime.date(2026, 1, 5),
     )
 
@@ -390,11 +407,19 @@ def test_spend_excludes_cancelled_orders(dbsession):
     VendorService.create(dbsession, "Amazon")
     ProductService.create(dbsession, "iPhone 15", "Apple")
     PurchaseOrderService.create(
-        dbsession, "PO-OK", "Amazon", "iPhone 15", 100.0,
+        dbsession,
+        "PO-OK",
+        "Amazon",
+        "iPhone 15",
+        100.0,
         order_date=datetime.date(2026, 1, 1),
     )
     PurchaseOrderService.create(
-        dbsession, "PO-CANCELLED", "Amazon", "iPhone 15", 900.0,
+        dbsession,
+        "PO-CANCELLED",
+        "Amazon",
+        "iPhone 15",
+        900.0,
         order_date=datetime.date(2026, 1, 2),
     )
     PurchaseOrderService.update_status(dbsession, "PO-CANCELLED", "cancelled")
@@ -408,7 +433,11 @@ def test_spend_includes_cancelled_orders_on_request(dbsession):
     VendorService.create(dbsession, "Amazon")
     ProductService.create(dbsession, "iPhone 15", "Apple")
     PurchaseOrderService.create(
-        dbsession, "PO-1", "Amazon", "iPhone 15", 100.0,
+        dbsession,
+        "PO-1",
+        "Amazon",
+        "iPhone 15",
+        100.0,
         order_date=datetime.date(2026, 1, 1),
     )
     PurchaseOrderService.update_status(dbsession, "PO-1", "cancelled")

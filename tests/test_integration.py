@@ -6,7 +6,6 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
-from sqlalchemy import select
 
 from buylog.models import Brand, Product, Vendor, Quote
 from buylog.services import (
@@ -23,6 +22,7 @@ from buylog.services import (
 # =============================================================================
 # Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def brand(dbsession):
@@ -77,7 +77,7 @@ def quote(dbsession, product, vendor):
 @pytest.fixture
 def temp_receipt_file():
     """Create a temporary receipt file."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.pdf', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".pdf", delete=False) as f:
         f.write("Receipt content")
         f.flush()
         yield f.name
@@ -88,10 +88,11 @@ def temp_receipt_file():
 # Clipboard Service Tests
 # =============================================================================
 
+
 class TestClipboardService:
     """Tests for ClipboardService."""
 
-    @patch('pyperclip.copy')
+    @patch("pyperclip.copy")
     def test_copy_quote(self, mock_copy, dbsession, quote):
         """Test copying quote to clipboard."""
         text = ClipboardService.copy_quote(dbsession, quote.id)
@@ -102,7 +103,7 @@ class TestClipboardService:
         assert "$100.00" in text
         mock_copy.assert_called_once_with(text)
 
-    @patch('pyperclip.copy')
+    @patch("pyperclip.copy")
     def test_copy_quote_includes_vendor_url(self, mock_copy, dbsession, quote):
         """Test that vendor URL is included when available."""
         text = ClipboardService.copy_quote(dbsession, quote.id)
@@ -114,7 +115,7 @@ class TestClipboardService:
         with pytest.raises(NotFoundError):
             ClipboardService.copy_quote(dbsession, 99999)
 
-    @patch('pyperclip.copy')
+    @patch("pyperclip.copy")
     def test_copy_product(self, mock_copy, dbsession, product, quote):
         """Test copying product to clipboard."""
         text = ClipboardService.copy_product(dbsession, product.name)
@@ -129,7 +130,7 @@ class TestClipboardService:
         with pytest.raises(NotFoundError):
             ClipboardService.copy_product(dbsession, "NonexistentProduct")
 
-    @patch('pyperclip.copy')
+    @patch("pyperclip.copy")
     def test_copy_vendor(self, mock_copy, dbsession, vendor):
         """Test copying vendor to clipboard."""
         text = ClipboardService.copy_vendor(dbsession, vendor.name)
@@ -148,6 +149,7 @@ class TestClipboardService:
 # =============================================================================
 # Vendor URL Service Tests
 # =============================================================================
+
 
 class TestVendorURLService:
     """Tests for VendorURLService."""
@@ -173,9 +175,11 @@ class TestVendorURLService:
     def test_set_url_vendor_not_found(self, dbsession):
         """Test setting URL for nonexistent vendor raises error."""
         with pytest.raises(NotFoundError):
-            VendorURLService.set_url(dbsession, "NonexistentVendor", "https://example.com")
+            VendorURLService.set_url(
+                dbsession, "NonexistentVendor", "https://example.com"
+            )
 
-    @patch('webbrowser.open')
+    @patch("webbrowser.open")
     def test_open_url(self, mock_open, dbsession, vendor):
         """Test opening vendor URL."""
         url = VendorURLService.open_url(dbsession, vendor.name)
@@ -208,6 +212,7 @@ class TestVendorURLService:
 # =============================================================================
 # Receipt Service Tests
 # =============================================================================
+
 
 class TestReceiptService:
     """Tests for ReceiptService."""
@@ -270,6 +275,7 @@ class TestReceiptService:
 # Scraper Service Tests
 # =============================================================================
 
+
 class TestScraperService:
     """Tests for ScraperService."""
 
@@ -278,7 +284,7 @@ class TestScraperService:
         with pytest.raises(ValidationError):
             ScraperService.scrape_price("not-a-url")
 
-    @patch('requests.get')
+    @patch("requests.get")
     def test_scrape_price_extracts_from_jsonld(self, mock_get):
         """Test extracting price from JSON-LD structured data."""
         mock_response = MagicMock()
@@ -309,7 +315,7 @@ class TestScraperService:
         assert result["price"] == 99.99
         assert result["currency"] == "USD"
 
-    @patch('requests.get')
+    @patch("requests.get")
     def test_scrape_price_extracts_from_meta(self, mock_get):
         """Test extracting price from meta tags."""
         mock_response = MagicMock()
@@ -329,7 +335,7 @@ class TestScraperService:
 
         assert result["price"] == 149.99
 
-    @patch('requests.get')
+    @patch("requests.get")
     def test_scrape_price_no_price_found(self, mock_get):
         """Test scraping page with no price returns None."""
         mock_response = MagicMock()
@@ -347,10 +353,11 @@ class TestScraperService:
         assert result["title"] == "Test Page"
         assert result["price"] is None
 
-    @patch('requests.get')
+    @patch("requests.get")
     def test_scrape_price_request_error(self, mock_get):
         """Test handling request errors."""
         import requests
+
         mock_get.side_effect = requests.RequestException("Connection failed")
 
         with pytest.raises(ServiceError):
@@ -358,7 +365,7 @@ class TestScraperService:
 
     def test_create_quote_from_scrape_product_not_found(self, dbsession, vendor):
         """Test creating quote with nonexistent product and no brand raises error."""
-        with patch.object(ScraperService, 'scrape_price') as mock_scrape:
+        with patch.object(ScraperService, "scrape_price") as mock_scrape:
             mock_scrape.return_value = {"price": 99.99, "currency": "USD"}
 
             with pytest.raises(ValidationError):
@@ -371,7 +378,7 @@ class TestScraperService:
 
     def test_create_quote_from_scrape_vendor_not_found(self, dbsession, product):
         """Test creating quote with nonexistent vendor raises error."""
-        with patch.object(ScraperService, 'scrape_price') as mock_scrape:
+        with patch.object(ScraperService, "scrape_price") as mock_scrape:
             mock_scrape.return_value = {"price": 99.99, "currency": "USD"}
 
             with pytest.raises(NotFoundError):
@@ -384,7 +391,7 @@ class TestScraperService:
 
     def test_create_quote_from_scrape_no_price(self, dbsession, vendor, product):
         """Test creating quote when no price scraped raises error."""
-        with patch.object(ScraperService, 'scrape_price') as mock_scrape:
+        with patch.object(ScraperService, "scrape_price") as mock_scrape:
             mock_scrape.return_value = {"price": None, "currency": "USD"}
 
             with pytest.raises(ValidationError):
@@ -395,8 +402,10 @@ class TestScraperService:
                     product.name,
                 )
 
-    @patch.object(ScraperService, 'scrape_price')
-    def test_create_quote_from_scrape_success(self, mock_scrape, dbsession, vendor, product):
+    @patch.object(ScraperService, "scrape_price")
+    def test_create_quote_from_scrape_success(
+        self, mock_scrape, dbsession, vendor, product
+    ):
         """Test successfully creating quote from scraped URL."""
         mock_scrape.return_value = {"price": 199.99, "currency": "USD"}
 
@@ -415,6 +424,7 @@ class TestScraperService:
 # =============================================================================
 # Model Field Tests
 # =============================================================================
+
 
 class TestModelFields:
     """Tests for new model fields."""

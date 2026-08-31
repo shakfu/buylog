@@ -1,23 +1,33 @@
 """Tests for workflow features: purchase lists, status, notes, tags, and watchlist."""
 
 import pytest
-from sqlalchemy import select
 
 from buylog.models import (
-    Brand, Product, Vendor, Quote,
-    PurchaseList, Note, Tag, EntityTag, Watchlist,
-    QUOTE_STATUS_CONSIDERING, QUOTE_STATUS_ORDERED, QUOTE_STATUS_RECEIVED,
+    Brand,
+    Product,
+    Vendor,
+    Quote,
+    Tag,
+    QUOTE_STATUS_CONSIDERING,
+    QUOTE_STATUS_ORDERED,
+    QUOTE_STATUS_RECEIVED,
 )
 from buylog.services import (
-    BrandService, ProductService, VendorService, QuoteService,
-    PurchaseListService, NoteService, TagService, WatchlistService,
-    NotFoundError, DuplicateError, ValidationError,
+    QuoteService,
+    PurchaseListService,
+    NoteService,
+    TagService,
+    WatchlistService,
+    NotFoundError,
+    DuplicateError,
+    ValidationError,
 )
 
 
 # =============================================================================
 # Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def brand(dbsession):
@@ -78,6 +88,7 @@ def quote2(dbsession, product, vendor):
 # Purchase List Tests
 # =============================================================================
 
+
 class TestPurchaseListService:
     """Tests for PurchaseListService."""
 
@@ -119,6 +130,7 @@ class TestPurchaseListService:
         """Test adding a quote to a list."""
         plist = PurchaseListService.create(dbsession, "QuoteList")
         updated = PurchaseListService.add_quote(dbsession, "QuoteList", quote.id)
+        assert updated.id == plist.id
         assert quote in updated.quotes
         assert len(updated.quotes) == 1
 
@@ -160,6 +172,7 @@ class TestPurchaseListService:
 # =============================================================================
 # Quote Status Tests
 # =============================================================================
+
 
 class TestQuoteStatus:
     """Tests for quote status functionality."""
@@ -206,6 +219,7 @@ class TestQuoteStatus:
 # =============================================================================
 # Note Tests
 # =============================================================================
+
 
 class TestNoteService:
     """Tests for NoteService."""
@@ -256,6 +270,7 @@ class TestNoteService:
 # Tag Tests
 # =============================================================================
 
+
 class TestTagService:
     """Tests for TagService."""
 
@@ -273,9 +288,7 @@ class TestTagService:
 
     def test_add_tag_to_entity(self, dbsession, product):
         """Test adding a tag to an entity."""
-        entity_tag = TagService.add_to_entity(
-            dbsession, "sale", "product", product.id
-        )
+        entity_tag = TagService.add_to_entity(dbsession, "sale", "product", product.id)
         assert entity_tag.entity_type == "product"
         assert entity_tag.entity_id == product.id
 
@@ -336,6 +349,7 @@ class TestTagService:
 # =============================================================================
 # Watchlist Tests
 # =============================================================================
+
 
 class TestWatchlistService:
     """Tests for WatchlistService."""

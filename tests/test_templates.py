@@ -25,7 +25,6 @@ from buylog.services import (
     VendorService,
     ProductService,
     QuoteService,
-    ValidationError,
     DuplicateError,
 )
 
@@ -33,6 +32,7 @@ from buylog.services import (
 # =============================================================================
 # Vendor Template Tests
 # =============================================================================
+
 
 def test_vendor_template_structure():
     """Test vendor template has correct structure"""
@@ -108,6 +108,7 @@ def test_vendor_import_duplicate(dbsession):
 # Specification Template Tests
 # =============================================================================
 
+
 def test_specification_template_structure():
     """Test specification template has correct structure"""
     tpl = specification_template("Test Spec")
@@ -179,6 +180,7 @@ def test_specification_import_minimal(dbsession):
 # =============================================================================
 # PurchaseOrder Template Tests
 # =============================================================================
+
 
 def test_purchase_order_template_structure():
     """Test purchase order template has correct structure"""
@@ -265,6 +267,7 @@ def test_purchase_order_import_with_date(dbsession):
 # =============================================================================
 # File I/O Tests
 # =============================================================================
+
 
 def test_load_template_yaml():
     """Test loading YAML template from file"""

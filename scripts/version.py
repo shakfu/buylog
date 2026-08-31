@@ -29,9 +29,13 @@ PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
 CHANGELOG_FILE = PROJECT_ROOT / "CHANGELOG.md"
 
 # Regex patterns
-INIT_VERSION_PATTERN = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']', re.MULTILINE)
-PYPROJECT_VERSION_PATTERN = re.compile(r'^version\s*=\s*["\']([^"\']+)["\']', re.MULTILINE)
-CHANGELOG_VERSION_PATTERN = re.compile(r'^## \[(\d+\.\d+\.\d+)\]', re.MULTILINE)
+INIT_VERSION_PATTERN = re.compile(
+    r'^__version__\s*=\s*["\']([^"\']+)["\']', re.MULTILINE
+)
+PYPROJECT_VERSION_PATTERN = re.compile(
+    r'^version\s*=\s*["\']([^"\']+)["\']', re.MULTILINE
+)
+CHANGELOG_VERSION_PATTERN = re.compile(r"^## \[(\d+\.\d+\.\d+)\]", re.MULTILINE)
 
 
 def get_init_version() -> Optional[str]:
@@ -170,6 +174,13 @@ def push_git_tag(version: str) -> bool:
         return False
 
 
+def get_latest_tag() -> Optional[str]:
+    """Return the most recent git tag, or None if the repo has no tags."""
+    result = run_git_command(["describe", "--tags", "--abbrev=0"], check=False)
+    tag = result.stdout.strip()
+    return tag or None
+
+
 def check_tag_exists(version: str) -> bool:
     """Check if tag already exists."""
     tag = f"v{version}"
@@ -188,6 +199,7 @@ def main() -> int:
     print(f"  __init__.py:   {versions['init'] or 'NOT FOUND'}")
     print(f"  pyproject.toml: {versions['pyproject'] or 'NOT FOUND'}")
     print(f"  CHANGELOG.md:   {versions['changelog'] or 'NOT FOUND'}")
+    print(f"  latest git tag: {get_latest_tag() or 'NONE'}")
     print()
 
     if not consistent:
@@ -240,7 +252,11 @@ def main() -> int:
         print()
         print("Next steps:")
         print("  1. Review changes: git diff")
-        print("  2. Commit: git add -A && git commit -m 'Bump version to {}'".format(new_version))
+        print(
+            "  2. Commit: git add -A && git commit -m 'Bump version to {}'".format(
+                new_version
+            )
+        )
         print("  3. Tag: python version.py tag")
 
         return 0

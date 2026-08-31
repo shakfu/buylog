@@ -16,15 +16,15 @@ diagram:
 	@uv run python scripts/gen_diagram.py
 
 lint:
-	@uv run ruff check --fix src/
+	@uv run ruff check --fix src/ tests/ scripts/
 
 typecheck:
 	@uv run mypy src/
 
 format:
-	@uv run ruff format src/
+	@uv run ruff format src/ tests/ scripts/
 
-qa: test lint typecheck format
+qa: test lint typecheck format version
 
 clean:
 	@find . | grep -E "(__pycache__|\.pyc|\.pyo$/)" | xargs rm -rf

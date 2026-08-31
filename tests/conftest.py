@@ -4,15 +4,15 @@ from sqlalchemy.orm import Session
 
 import buylog.models as models
 
-DEBUG=False
+DEBUG = False
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def engine():
-    return create_engine('sqlite:///:memory:', echo=DEBUG)
+    return create_engine("sqlite:///:memory:", echo=DEBUG)
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def tables(engine):
     models.init_db(engine)
     yield

@@ -79,9 +79,13 @@ def test_migrations_enforce_unique_constraints(fresh_engine):
     run_migrations(fresh_engine)
 
     with Session(fresh_engine) as session:
-        session.add(models.Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.1))
+        session.add(
+            models.Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.1)
+        )
         session.commit()
-        session.add(models.Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.2))
+        session.add(
+            models.Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.2)
+        )
         with pytest.raises(IntegrityError):
             session.commit()
 

@@ -3,6 +3,7 @@
 
 import os
 import logging
+import warnings
 from pathlib import Path
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
@@ -23,23 +24,41 @@ def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
         cursor.close()
 
 
+# Settings were originally prefixed BUYER_ (the project's former name). The
+# BUYLOG_ prefix is canonical now and matches the notification settings; the
+# old names still work but warn, and will be removed in a future release.
+_LEGACY_ENV_PREFIX = "BUYER_"
+
+
+def _env(name: str, default: str) -> str:
+    """Read BUYLOG_<name>, falling back to the deprecated BUYER_<name>."""
+    value = os.getenv(f"BUYLOG_{name}")
+    if value is not None:
+        return value
+    legacy = os.getenv(f"{_LEGACY_ENV_PREFIX}{name}")
+    if legacy is not None:
+        warnings.warn(
+            f"{_LEGACY_ENV_PREFIX}{name} is deprecated; use BUYLOG_{name} instead.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return legacy
+    return default
+
+
 class Config:
     """Application configuration"""
 
     # Environment
-    ENV = os.getenv("BUYER_ENV", "development")
+    ENV = _env("ENV", "development")
 
     # Database configuration
-    DB_PATH = Path(
-        os.getenv("BUYER_DB_PATH", str(Path.home() / ".buylog" / "buylog.db"))
-    )
+    DB_PATH = Path(_env("DB_PATH", str(Path.home() / ".buylog" / "buylog.db")))
     DB_URL = f"sqlite:///{DB_PATH}"
 
     # Logging configuration
-    LOG_LEVEL = os.getenv("BUYER_LOG_LEVEL", "INFO")
-    LOG_PATH = Path(
-        os.getenv("BUYER_LOG_PATH", str(Path.home() / ".buylog" / "buylog.log"))
-    )
+    LOG_LEVEL = _env("LOG_LEVEL", "INFO")
+    LOG_PATH = Path(_env("LOG_PATH", str(Path.home() / ".buylog" / "buylog.log")))
 
     # Ensure database directory exists
     @classmethod
@@ -138,5 +157,5 @@ config_map = {
 def get_config(env=None):
     """Get configuration for specified environment"""
     if env is None:
-        env = os.getenv("BUYER_ENV", "development")
+        env = _env("ENV", "development")
     return config_map.get(env, DevelopmentConfig)

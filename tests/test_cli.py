@@ -14,7 +14,7 @@ import pytest
 @pytest.fixture
 def cli(tmp_path, monkeypatch):
     """A freshly imported cli module bound to a temporary database."""
-    monkeypatch.setenv("BUYER_DB_PATH", str(tmp_path / "cli.db"))
+    monkeypatch.setenv("BUYLOG_DB_PATH", str(tmp_path / "cli.db"))
     for name in ("buylog.cli", "buylog.config", "buylog"):
         sys.modules.pop(name, None)
     module = importlib.import_module("buylog.cli")
@@ -64,11 +64,17 @@ def test_po_lifecycle(cli, capsys):
 
     assert not run(
         cli,
-        "po", "create", "PO-001",
-        "--vendor", "Amazon",
-        "--product", "iPhone 15",
-        "--price", "999.99",
-        "--quantity", "2",
+        "po",
+        "create",
+        "PO-001",
+        "--vendor",
+        "Amazon",
+        "--product",
+        "iPhone 15",
+        "--price",
+        "999.99",
+        "--quantity",
+        "2",
     )
     assert "PO-001" in capsys.readouterr().out
 
@@ -98,8 +104,15 @@ def test_spec_lifecycle(cli, capsys):
     assert "Camera Spec" in capsys.readouterr().out
 
     assert not run(
-        cli, "spec", "add-feature", "Camera Spec", "Resolution",
-        "--type", "number", "--unit", "MP",
+        cli,
+        "spec",
+        "add-feature",
+        "Camera Spec",
+        "Resolution",
+        "--type",
+        "number",
+        "--unit",
+        "MP",
     )
     capsys.readouterr()
 
@@ -170,9 +183,17 @@ def test_add_quote_creates_missing_entities_with_yes(cli, capsys):
     run(cli, "add", "--vendor", "Amazon")
     capsys.readouterr()
     assert not run(
-        cli, "--yes", "add",
-        "--vendor", "Amazon", "--product", "iPhone 15",
-        "--brand", "Apple", "--quote", "999",
+        cli,
+        "--yes",
+        "add",
+        "--vendor",
+        "Amazon",
+        "--product",
+        "iPhone 15",
+        "--brand",
+        "Apple",
+        "--quote",
+        "999",
     )
     assert "Added quote" in capsys.readouterr().out
 
@@ -190,8 +211,19 @@ def test_check_quiet_prints_nothing_when_idle(cli, capsys):
 
 def test_check_reports_a_triggered_alert(cli, capsys):
     run(cli, "add", "--vendor", "Amazon")
-    run(cli, "--yes", "add", "--vendor", "Amazon", "--product", "iPhone 15",
-        "--brand", "Apple", "--quote", "899")
+    run(
+        cli,
+        "--yes",
+        "add",
+        "--vendor",
+        "Amazon",
+        "--product",
+        "iPhone 15",
+        "--brand",
+        "Apple",
+        "--quote",
+        "899",
+    )
     run(cli, "alert", "add", "iPhone 15", "900")
     capsys.readouterr()
 
@@ -203,8 +235,19 @@ def test_check_reports_a_triggered_alert(cli, capsys):
 
 def test_check_notifies_on_the_requested_channel(cli, capsys):
     run(cli, "add", "--vendor", "Amazon")
-    run(cli, "--yes", "add", "--vendor", "Amazon", "--product", "iPhone 15",
-        "--brand", "Apple", "--quote", "899")
+    run(
+        cli,
+        "--yes",
+        "add",
+        "--vendor",
+        "Amazon",
+        "--product",
+        "iPhone 15",
+        "--brand",
+        "Apple",
+        "--quote",
+        "899",
+    )
     run(cli, "alert", "add", "iPhone 15", "900")
     capsys.readouterr()
 
@@ -214,8 +257,19 @@ def test_check_notifies_on_the_requested_channel(cli, capsys):
 
 def test_check_rejects_an_unknown_channel(cli, capsys):
     run(cli, "add", "--vendor", "Amazon")
-    run(cli, "--yes", "add", "--vendor", "Amazon", "--product", "iPhone 15",
-        "--brand", "Apple", "--quote", "899")
+    run(
+        cli,
+        "--yes",
+        "add",
+        "--vendor",
+        "Amazon",
+        "--product",
+        "iPhone 15",
+        "--brand",
+        "Apple",
+        "--quote",
+        "899",
+    )
     run(cli, "alert", "add", "iPhone 15", "900")
     capsys.readouterr()
 
@@ -258,11 +312,24 @@ def test_spend_on_an_empty_database(cli, capsys):
 
 
 def test_spend_reports_committed_money(cli, capsys):
-    run(cli, "add", "--brand", "Apple", "--product", "iPhone 15",
-        "--category", "phones")
+    run(
+        cli, "add", "--brand", "Apple", "--product", "iPhone 15", "--category", "phones"
+    )
     run(cli, "add", "--vendor", "Amazon")
-    run(cli, "po", "create", "PO-1", "--vendor", "Amazon", "--product", "iPhone 15",
-        "--price", "999", "--order-date", "2026-01-15")
+    run(
+        cli,
+        "po",
+        "create",
+        "PO-1",
+        "--vendor",
+        "Amazon",
+        "--product",
+        "iPhone 15",
+        "--price",
+        "999",
+        "--order-date",
+        "2026-01-15",
+    )
     capsys.readouterr()
 
     assert not run(cli, "spend")
@@ -276,8 +343,20 @@ def test_spend_reports_committed_money(cli, capsys):
 def test_spend_vendor_report_only(cli, capsys):
     run(cli, "add", "--brand", "Apple", "--product", "iPhone 15")
     run(cli, "add", "--vendor", "Amazon")
-    run(cli, "po", "create", "PO-1", "--vendor", "Amazon", "--product", "iPhone 15",
-        "--price", "999", "--order-date", "2026-01-15")
+    run(
+        cli,
+        "po",
+        "create",
+        "PO-1",
+        "--vendor",
+        "Amazon",
+        "--product",
+        "iPhone 15",
+        "--price",
+        "999",
+        "--order-date",
+        "2026-01-15",
+    )
     capsys.readouterr()
 
     assert not run(cli, "spend", "vendor")
@@ -294,8 +373,19 @@ def test_scrape_refresh_with_nothing_tracked(cli, capsys):
 def test_list_quotes_shows_the_source_currency(cli, capsys):
     run(cli, "add-fx", "--code", "EUR", "--usd-per-unit", "1.1")
     run(cli, "add", "--vendor", "EuroShop", "--currency", "EUR")
-    run(cli, "--yes", "add", "--vendor", "EuroShop", "--product", "iPhone 15",
-        "--brand", "Apple", "--quote", "850")
+    run(
+        cli,
+        "--yes",
+        "add",
+        "--vendor",
+        "EuroShop",
+        "--product",
+        "iPhone 15",
+        "--brand",
+        "Apple",
+        "--quote",
+        "850",
+    )
     capsys.readouterr()
 
     assert not run(cli, "list", "quotes")
@@ -307,8 +397,20 @@ def test_list_quotes_shows_the_source_currency(cli, capsys):
 def test_spend_analysis_report_renders(cli, capsys):
     run(cli, "add", "--brand", "Apple", "--product", "iPhone 15")
     run(cli, "add", "--vendor", "Amazon")
-    run(cli, "po", "create", "PO-1", "--vendor", "Amazon", "--product", "iPhone 15",
-        "--price", "999", "--order-date", "2026-01-15")
+    run(
+        cli,
+        "po",
+        "create",
+        "PO-1",
+        "--vendor",
+        "Amazon",
+        "--product",
+        "iPhone 15",
+        "--price",
+        "999",
+        "--order-date",
+        "2026-01-15",
+    )
     capsys.readouterr()
 
     assert not run(cli, "report", "spend-analysis")
@@ -322,8 +424,19 @@ def test_check_reports_a_partial_notification_failure(cli, capsys, monkeypatch):
     """A cron run must not report success when a channel silently lost the alert."""
     monkeypatch.delenv("BUYLOG_NTFY_TOPIC", raising=False)
     run(cli, "add", "--vendor", "Amazon")
-    run(cli, "--yes", "add", "--vendor", "Amazon", "--product", "iPhone 15",
-        "--brand", "Apple", "--quote", "899")
+    run(
+        cli,
+        "--yes",
+        "add",
+        "--vendor",
+        "Amazon",
+        "--product",
+        "iPhone 15",
+        "--brand",
+        "Apple",
+        "--quote",
+        "899",
+    )
     run(cli, "alert", "add", "iPhone 15", "900")
     capsys.readouterr()
 

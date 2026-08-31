@@ -17,7 +17,7 @@ MODULES = ("buylog.tui", "buylog.cli", "buylog.config", "buylog")
 @pytest.fixture
 def tui(tmp_path, monkeypatch):
     """A freshly imported tui module bound to a temporary database."""
-    monkeypatch.setenv("BUYER_DB_PATH", str(tmp_path / "tui.db"))
+    monkeypatch.setenv("BUYLOG_DB_PATH", str(tmp_path / "tui.db"))
     for name in MODULES:
         sys.modules.pop(name, None)
     module = importlib.import_module("buylog.tui")
@@ -33,9 +33,7 @@ def seeded(tui):
 
     session = tui.Session()
     VendorService.create(session, "Amazon")
-    QuoteService.create(
-        session, "Amazon", "iPhone 15", 999.0, brand_name="Apple"
-    )
+    QuoteService.create(session, "Amazon", "iPhone 15", 999.0, brand_name="Apple")
     session.close()
     return tui
 
@@ -47,8 +45,16 @@ async def test_app_starts_and_builds_every_tab(tui):
     async with app.run_test() as pilot:
         await pilot.pause()
         for table_id in (
-            "brands", "products", "vendors", "quotes", "forex",
-            "alerts", "lists", "watchlist", "specs", "pos",
+            "brands",
+            "products",
+            "vendors",
+            "quotes",
+            "forex",
+            "alerts",
+            "lists",
+            "watchlist",
+            "specs",
+            "pos",
         ):
             table = app.query_one(f"#{table_id}-table", DataTable)
             assert table.columns, f"{table_id} table has no columns"

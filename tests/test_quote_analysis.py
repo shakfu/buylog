@@ -1,9 +1,7 @@
 """Tests for quote analysis features: best prices, history tracking, and price alerts"""
 
-import datetime
 import pytest
 from buylog.services import (
-    BrandService,
     ProductService,
     VendorService,
     QuoteService,
@@ -13,7 +11,6 @@ from buylog.services import (
     ValidationError,
     NotFoundError,
 )
-from buylog.models import Quote, QuoteHistory, PriceAlert, Product
 
 
 # Quote total_cost property tests
@@ -250,6 +247,7 @@ class TestPriceAlertService:
 
         triggered = PriceAlertService.check_alerts(dbsession, quote.product, 850.0)
         assert len(triggered) == 1
+        assert triggered[0].id == alert.id
 
     def test_check_alerts_already_triggered(self, dbsession):
         """Already triggered alerts don't trigger again"""

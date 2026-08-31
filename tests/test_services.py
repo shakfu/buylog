@@ -12,7 +12,7 @@ from buylog.services import (
     DuplicateError,
     NotFoundError,
 )
-from buylog.models import Brand, Product, Vendor, Quote, Forex, Specification
+from buylog.models import Brand, Product, Forex, Specification
 
 
 # BrandService Tests
@@ -530,7 +530,9 @@ def test_product_feature_service_set_value_text(dbsession):
     )
     ProductService.create(dbsession, "iPhone 15", "Apple")
 
-    pf = ProductFeatureService.set_value(dbsession, "iPhone 15", feature.id, "Space Black")
+    pf = ProductFeatureService.set_value(
+        dbsession, "iPhone 15", feature.id, "Space Black"
+    )
 
     assert pf.value_text == "Space Black"
     assert pf.value == "Space Black"
@@ -619,7 +621,6 @@ def test_product_feature_service_get_features(dbsession):
 def test_product_feature_service_validate_required(dbsession):
     """Test validation of required features"""
     from buylog.services import SpecificationService, ProductFeatureService
-    from buylog.models import Specification
 
     SpecificationService.create(dbsession, "Phone Specs")
     SpecificationService.add_feature(
@@ -966,16 +967,16 @@ def test_delete_quote_removes_its_history(dbsession):
         dbsession, "Amazon", "iPhone 15", 999.0, brand_name="Apple"
     )
     quote_id = quote.id
-    assert dbsession.execute(
-        select(QuoteHistory).where(QuoteHistory.quote_id == quote_id)
-    ).scalars().all()
+    assert (
+        dbsession.execute(select(QuoteHistory).where(QuoteHistory.quote_id == quote_id))
+        .scalars()
+        .all()
+    )
 
     QuoteService.delete(dbsession, quote_id)
 
     orphans = (
-        dbsession.execute(
-            select(QuoteHistory).where(QuoteHistory.quote_id == quote_id)
-        )
+        dbsession.execute(select(QuoteHistory).where(QuoteHistory.quote_id == quote_id))
         .scalars()
         .all()
     )
@@ -1050,9 +1051,7 @@ def test_quote_service_update_converts_price(dbsession):
     dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.2))
     dbsession.commit()
     VendorService.create(dbsession, "EuroShop", currency="EUR")
-    quote = QuoteService.create(
-        dbsession, "EuroShop", "TV", 100.0, brand_name="Sony"
-    )
+    quote = QuoteService.create(dbsession, "EuroShop", "TV", 100.0, brand_name="Sony")
 
     updated = QuoteService.update(dbsession, quote.id, price=200.0)
 
@@ -1250,7 +1249,6 @@ def test_deleting_a_quote_detaches_it_from_its_purchase_order(dbsession):
 
 def test_commit_or_rollback_discards_work_when_the_body_fails(dbsession):
     """A non-database error inside the block must not leave writes pending."""
-    from buylog.models import Brand
     from buylog.services import commit_or_rollback
 
     with pytest.raises(RuntimeError):

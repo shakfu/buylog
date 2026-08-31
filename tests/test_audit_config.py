@@ -68,7 +68,7 @@ def test_importing_audit_creates_no_log_file(tmp_path):
     import sys
 
     env = dict(os.environ, HOME=str(tmp_path))
-    env.pop("BUYER_DB_PATH", None)
+    env.pop("BUYLOG_DB_PATH", None)
     result = subprocess.run(
         [sys.executable, "-c", "import buylog.audit"],
         env=env,
@@ -93,12 +93,45 @@ def test_db_path_follows_the_environment(monkeypatch, tmp_path):
 
     import buylog.config
 
-    monkeypatch.setenv("BUYER_DB_PATH", str(tmp_path / "custom.db"))
+    monkeypatch.setenv("BUYLOG_DB_PATH", str(tmp_path / "custom.db"))
     reloaded = importlib.reload(buylog.config)
     try:
         assert reloaded.Config.get_db_path() == tmp_path / "custom.db"
     finally:
+        monkeypatch.delenv("BUYLOG_DB_PATH")
+        importlib.reload(buylog.config)
+
+
+def test_legacy_buyer_prefix_still_works_but_warns(monkeypatch, tmp_path):
+    """The project was renamed; BUYER_* must keep working until it is removed."""
+    import importlib
+
+    import buylog.config
+
+    monkeypatch.delenv("BUYLOG_DB_PATH", raising=False)
+    monkeypatch.setenv("BUYER_DB_PATH", str(tmp_path / "legacy.db"))
+    try:
+        with pytest.warns(UserWarning, match="BUYER_DB_PATH is deprecated"):
+            reloaded = importlib.reload(buylog.config)
+        assert reloaded.Config.get_db_path() == tmp_path / "legacy.db"
+    finally:
         monkeypatch.delenv("BUYER_DB_PATH")
+        importlib.reload(buylog.config)
+
+
+def test_buylog_prefix_wins_over_legacy_buyer_prefix(monkeypatch, tmp_path):
+    import importlib
+
+    import buylog.config
+
+    monkeypatch.setenv("BUYER_DB_PATH", str(tmp_path / "legacy.db"))
+    monkeypatch.setenv("BUYLOG_DB_PATH", str(tmp_path / "current.db"))
+    try:
+        reloaded = importlib.reload(buylog.config)
+        assert reloaded.Config.get_db_path() == tmp_path / "current.db"
+    finally:
+        monkeypatch.delenv("BUYER_DB_PATH")
+        monkeypatch.delenv("BUYLOG_DB_PATH")
         importlib.reload(buylog.config)
 
 

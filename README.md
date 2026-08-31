@@ -485,8 +485,8 @@ Business logic is separated into service classes:
 
 The application uses a configuration system via `config.py`:
 
-- Database path: `~/.buylog/buylog.db` (configurable via `BUYER_DB_PATH`)
-- Log level: `INFO` by default (configurable via `BUYER_LOG_LEVEL`)
+- Database path: `~/.buylog/buylog.db` (configurable via `BUYLOG_DB_PATH`)
+- Log level: `INFO` by default (configurable via `BUYLOG_LOG_LEVEL`)
 - Logging: Configured for both file and console output
 
 Notifications are configured separately, via the `BUYLOG_NOTIFY` and per-channel

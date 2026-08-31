@@ -1,9 +1,7 @@
 """Tests for Excel import/export functionality."""
 
 import tempfile
-from pathlib import Path
 
-import pytest
 from openpyxl import load_workbook
 
 from buylog.excel import (
@@ -39,6 +37,7 @@ from buylog.services import (
 # =============================================================================
 # Export Tests
 # =============================================================================
+
 
 def test_export_brands(dbsession):
     """Test exporting brands to Excel."""
@@ -100,8 +99,10 @@ def test_export_quotes(dbsession):
 
 def test_export_specifications(dbsession):
     """Test exporting specifications to Excel."""
-    spec = SpecificationService.create(dbsession, "Camera Spec", "For cameras")
-    SpecificationService.add_feature(dbsession, "Camera Spec", "Resolution", "number", "MP")
+    SpecificationService.create(dbsession, "Camera Spec", "For cameras")
+    SpecificationService.add_feature(
+        dbsession, "Camera Spec", "Resolution", "number", "MP"
+    )
 
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
         count = export_specifications(dbsession, f.name)
@@ -154,6 +155,7 @@ def test_export_all(dbsession):
 # =============================================================================
 # Template Tests
 # =============================================================================
+
 
 def test_generate_vendor_template():
     """Test generating vendor import template."""
@@ -214,6 +216,7 @@ def test_generate_purchase_order_template(dbsession):
 # Import Tests
 # =============================================================================
 
+
 def test_import_vendors(dbsession):
     """Test importing vendors from Excel."""
     # Generate template and modify it
@@ -224,12 +227,27 @@ def test_import_vendors(dbsession):
         wb = load_workbook(f.name)
         ws = wb.active
         # Row 2 has example data, add row 3 with real data
-        ws.append([
-            "Test Vendor", "EUR", "DISC10", "10", "https://test.com",
-            "John", "john@test.com", "+1234", "https://test.com",
-            "123 St", "", "Berlin", "BE", "10001", "Germany",
-            "DE123", "Net 30",
-        ])
+        ws.append(
+            [
+                "Test Vendor",
+                "EUR",
+                "DISC10",
+                "10",
+                "https://test.com",
+                "John",
+                "john@test.com",
+                "+1234",
+                "https://test.com",
+                "123 St",
+                "",
+                "Berlin",
+                "BE",
+                "10001",
+                "Germany",
+                "DE123",
+                "Net 30",
+            ]
+        )
         wb.save(f.name)
 
         success, errors = import_vendors(dbsession, f.name)
@@ -309,13 +327,23 @@ def test_import_purchase_orders(dbsession):
 
         wb = load_workbook(f.name)
         ws = wb.active
-        ws.append([
-            "PO-TEST-001", "Test Vendor", "Test Product",
-            "2", "99.99", "USD",
-            "10", "5",
-            "2025-01-15", "",
-            "INV-001", "Test notes", "pending",
-        ])
+        ws.append(
+            [
+                "PO-TEST-001",
+                "Test Vendor",
+                "Test Product",
+                "2",
+                "99.99",
+                "USD",
+                "10",
+                "5",
+                "2025-01-15",
+                "",
+                "INV-001",
+                "Test notes",
+                "pending",
+            ]
+        )
         wb.save(f.name)
 
         success, errors = import_purchase_orders(dbsession, f.name)
