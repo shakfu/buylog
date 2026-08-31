@@ -5,17 +5,23 @@ A Python tool to help you keep track of what you buy and want to buy.
 ## Features
 
 - **Command Line Interface (CLI)** - Full CRUD operations for managing brands, products, vendors, and quotes
+
 - **Text User Interface (TUI)** - Interactive terminal UI built with Textual
+
 - **Data Persistence** - SQLAlchemy ORM with SQLite support
-- **Multi-currency Support** - Forex rate tracking with automatic currency conversion,
-  automatic rate refresh from a public API, and source-currency display throughout
+
+- **Multi-currency Support** - Forex rate tracking with automatic currency conversion, automatic rate refresh from a public API, and source-currency display throughout
+
 - **Quote Analysis** - Best price highlighting, price history tracking, and price alerts
-- **Automation** - `buylog check` for cron, with notifications via ntfy, webhook,
-  desktop or email; scheduled re-scraping of tracked product URLs
-- **Spend Analytics** - What you actually spent, by month, vendor and category,
-  plus how each purchase compared to the best price on record
+
+- **Automation** - `buylog check` for cron, with notifications via ntfy, webhook, desktop or email; scheduled re-scraping of tracked product URLs
+
+- **Spend Analytics** - What you actually spent, by month, vendor and category, plus how each purchase compared to the best price on record
+
 - **Service Layer** - Business logic separation with validation and error handling
+
 - **Audit Logging** - Track entity creation, updates, and deletions
+
 - **Testing** - pytest-based test suite with transactional fixtures
 
 ## Installation
@@ -263,8 +269,7 @@ buylog migrate --dry-run                             # Preview SQL without execu
 
 #### Running on a schedule
 
-`buylog check` is built for cron: it takes no interactive input, prints nothing
-when `--quiet` and nothing has triggered, and exits non-zero on failure.
+`buylog check` is built for cron: it takes no interactive input, prints nothing when `--quiet` and nothing has triggered, and exits non-zero on failure.
 
 ```cron
 # Refresh rates and prices, then notify, every morning at 08:00
@@ -274,8 +279,7 @@ when `--quiet` and nothing has triggered, and exits non-zero on failure.
 
 #### Notification channels
 
-Channels are selected with `BUYLOG_NOTIFY` (comma-separated) or `--notify`, and
-configured entirely by environment variable so a cron entry needs no arguments.
+Channels are selected with `BUYLOG_NOTIFY` (comma-separated) or `--notify`, and configured entirely by environment variable so a cron entry needs no arguments.
 
 | Channel   | Required                          | Optional |
 | --------- | --------------------------------- | -------- |
@@ -285,14 +289,11 @@ configured entirely by environment variable so a cron entry needs no arguments.
 | `desktop` | `notify-send`/`terminal-notifier`/`osascript` | - |
 | `email`   | `BUYLOG_SMTP_HOST`, `BUYLOG_EMAIL_TO` | `BUYLOG_SMTP_PORT`, `BUYLOG_SMTP_USER`, `BUYLOG_SMTP_PASSWORD`, `BUYLOG_SMTP_STARTTLS`, `BUYLOG_EMAIL_FROM` |
 
-A channel that is selected but not configured reports the variable it needs
-rather than failing silently.
+A channel that is selected but not configured reports the variable it needs rather than failing silently.
 
 #### Exit codes
 
-The CLI is safe to script: `0` on success, `1` on a handled error, `130` on
-interrupt. Confirmation prompts never block on a non-interactive stdin - pass
-`--yes` to confirm automatically.
+The CLI is safe to script: `0` on success, `1` on a handled error, `130` on interrupt. Confirmation prompts never block on a non-interactive stdin - pass `--yes` to confirm automatically.
 
 ### Text User Interface (TUI)
 
@@ -305,45 +306,85 @@ buylog tui
 The TUI provides:
 
 - Tabbed interface for Brands, Products, Vendors, Quotes, Forex rates, Alerts, Lists, Watchlist, Purchase Orders, and Specifications
+
 - DataTables with row selection
+
 - Modal forms for adding entities
+
 - Search/filter functionality
+
 - **Quote Analysis Features**:
+
   - Best prices highlighted in green
+
   - Total cost calculation (with discount, shipping, tax)
+
   - Price trend indicators (^ up, v down, - stable, * new)
+
   - Sparkline mini-graphs showing price history
+
   - Triggered alerts highlighted in yellow
+
   - **Status column** with color coding (considering=cyan, ordered=yellow, received=green)
+
 - **Workflow Features**:
+
   - **Lists tab** - View and manage purchase lists
+
   - **Watchlist tab** - Monitor products with target prices
+
   - Set quote status with `t` key
+
   - Add to watchlist with `w` key
+
 - **Integration Features**:
+
   - **URL column** in Vendors tab showing link indicators
+
   - Copy to clipboard with `y` key (quotes, products, vendors)
+
   - Open vendor URL with `o` key (on Vendors tab)
+
 - **Quick Filters** for quotes by vendor, brand, or price range
+
 - **Inline Editing** - Edit entities directly with `e` key
+
 - **Column Sorting** - Click headers or press number keys to sort
+
 - **Price Comparison** - Compare prices with `c` key (select type: Product/Search/Category/Brand)
+
 - Keyboard shortcuts:
+
   - `q` - Quit
+
   - `a` - Add new entity
+
   - `c` - Compare prices
+
   - `d` - Delete selected entity
+
   - `e` - Edit selected entity
+
   - `f` - Filter quotes
+
   - `o` - Open vendor URL (vendors tab)
+
   - `r` - Refresh data
+
   - `s` or `/` - Focus search
+
   - `t` - Set quote status
+
   - `w` - Add to watchlist
+
   - `y` - Copy to clipboard
+
   - `Ctrl+1-0` - Switch tabs directly (1-9 and 0 for tab 10)
+
   - `h/l` - Previous/next tab (vim-style)
+
   - `j/k` - Move cursor down/up (vim-style)
+
   - `1-7` - Sort by column number
 
 ## Development
@@ -421,30 +462,51 @@ buylog/
 The core domain models:
 
 - **Vendor** - Selling entities with currency, discount codes, contact info, and address
+
 - **Brand** - Manufacturing entities linked to products and vendors
+
 - **Product** - Items with brand associations and optional specification links
+
 - **Quote** - Price quotes from vendors with shipping, tax, status, and total cost calculation
+
 - **QuoteHistory** - Price change tracking for quotes (create/update events)
+
 - **PriceAlert** - Price threshold alerts for products
+
 - **Forex** - Currency exchange rates for multi-currency support
+
 - **PurchaseList** - Named shopping lists grouping quotes
+
 - **PurchaseOrder** - Committed purchases with status tracking and delivery dates
+
 - **Specification** - Structured product attribute definitions
+
 - **SpecificationFeature** - Feature definitions with data types and validation
+
 - **ProductFeature** - Feature values for products
+
 - **Note** - Freeform notes attachable to any entity (polymorphic)
+
 - **Tag** - Categorization tags with optional color
+
 - **EntityTag** - Junction table for tagging any entity
+
 - **Watchlist** - Product monitoring with target prices
 
 Key relationships:
 
 - Many-to-many between Vendors and Brands (via `vendor_brand` junction table)
+
 - One-to-many from Brand to Products
+
 - One-to-many from Vendor and Product to Quotes
+
 - One-to-many from Quote to QuoteHistory
+
 - One-to-many from Product to PriceAlert
+
 - Many-to-many between PurchaseList and Quotes (via `purchase_list_quote` junction table)
+
 - One-to-many from Product to Watchlist
 
 See the auto-generated ER diagram: [`doc/er_model.md`](doc/er_model.md)
@@ -454,31 +516,53 @@ See the auto-generated ER diagram: [`doc/er_model.md`](doc/er_model.md)
 Business logic is separated into service classes:
 
 - `BrandService` - Brand CRUD with validation
+
 - `ProductService` - Product management with eager loading
+
 - `VendorService` - Vendor operations with extended contact/address fields
+
 - `QuoteService` - Quote management with currency conversion, best price detection, price updates, and status tracking
+
 - `QuoteHistoryService` - Price history tracking and trend computation
+
 - `PriceAlertService` - Price alert creation, triggering, and management
+
 - `ComparisonService` - Price comparison by product, search, category, or brand
+
 - `PurchaseListService` - Purchase list CRUD, add/remove quotes
+
 - `PurchaseOrderService` - Purchase order CRUD, status transitions, create from quote
+
 - `SpecificationService` - Specification and feature management
+
 - `ProductFeatureService` - Product feature value management
+
 - `NoteService` - Note CRUD for any entity type
+
 - `TagService` - Tag management and entity tagging
+
 - `WatchlistService` - Watchlist management with target prices
+
 - `ReportService` - HTML report generation (price comparison, purchase summary, vendor analysis)
+
 - `AuditService` - Entity change tracking
 
 ## Technologies
 
 - **Python 3.13+** - Core language
+
 - **SQLAlchemy 2.0+** - ORM and database abstraction
+
 - **Textual** - Modern terminal UI framework
+
 - **openpyxl** - Excel file read/write
+
 - **pytest** - Testing framework
+
 - **uv** - Fast Python package manager
+
 - **eralchemy** - ER diagram generation
+
 - **tabulate** - CLI table formatting
 
 ## Configuration
@@ -486,11 +570,12 @@ Business logic is separated into service classes:
 The application uses a configuration system via `config.py`:
 
 - Database path: `~/.buylog/buylog.db` (configurable via `BUYLOG_DB_PATH`)
+
 - Log level: `INFO` by default (configurable via `BUYLOG_LOG_LEVEL`)
+
 - Logging: Configured for both file and console output
 
-Notifications are configured separately, via the `BUYLOG_NOTIFY` and per-channel
-environment variables listed under [Notification channels](#notification-channels).
+Notifications are configured separately, via the `BUYLOG_NOTIFY` and per-channel environment variables listed under [Notification channels](#notification-channels).
 
 ## License
 
