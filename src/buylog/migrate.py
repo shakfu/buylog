@@ -3,7 +3,8 @@
 Simple database migration for buylog.
 
 Compares SQLAlchemy models to actual database schema and applies changes.
-Only handles additive changes (new tables, new columns) - not destructive ones.
+New tables and columns are added. The one removal is ``vendor.website``,
+which is copied into ``vendor.url`` (or a vendor note) and then dropped.
 """
 
 import logging
@@ -241,6 +242,38 @@ def generate_migrations(engine: Engine) -> list[str]:
     return migrations
 
 
+def vendor_website_statements(engine: Engine) -> list[str]:
+    """
+    Copy ``vendor.website`` into ``url`` and drop the column.
+
+    ``url`` wins when both are set. A blank ``url`` takes the website value.
+    A website that differs from ``url`` is kept as a vendor note.
+    Databases created from the current models never had the column.
+    """
+    inspector = inspect(engine)
+    if "vendor" not in inspector.get_table_names():
+        return []
+    columns = {column["name"] for column in inspector.get_columns("vendor")}
+    if "website" not in columns:
+        return []
+    return [
+        "UPDATE vendor SET url = website "
+        "WHERE (url IS NULL OR trim(url) = '') "
+        "AND website IS NOT NULL AND trim(website) != ''",
+        "INSERT INTO note (entity_type, entity_id, content, created_at) "
+        "SELECT 'vendor', id, 'Website before migration: ' || trim(website), "
+        "CURRENT_TIMESTAMP FROM vendor "
+        "WHERE website IS NOT NULL AND trim(website) != '' "
+        "AND trim(website) != trim(url)",
+        "ALTER TABLE vendor DROP COLUMN website",
+    ]
+
+
+def pending_migrations(engine: Engine) -> list[str]:
+    """Schema changes the database still needs, including the website fold."""
+    return generate_migrations(engine) + vendor_website_statements(engine)
+
+
 def run_migrations(engine: Engine, dry_run: bool = False) -> list[str]:
     """
     Run database migrations.
@@ -255,7 +288,7 @@ def run_migrations(engine: Engine, dry_run: bool = False) -> list[str]:
     Raises:
         MigrationError: If any statement failed to apply
     """
-    migrations = generate_migrations(engine)
+    migrations = pending_migrations(engine)
 
     if not migrations:
         logger.info("Database schema is up to date")
@@ -296,4 +329,4 @@ def run_migrations(engine: Engine, dry_run: bool = False) -> list[str]:
 
 def check_migrations(engine: Engine) -> list[str]:
     """Check what migrations are needed without applying them."""
-    return generate_migrations(engine)
+    return pending_migrations(engine)

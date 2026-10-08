@@ -181,7 +181,8 @@ def export_vendors(session: Session, filepath: Union[str, Path]) -> int:
                 v.contact_person,
                 v.email,
                 v.phone,
-                v.website,
+                # Kept so older sheets still line up. The link is the URL column.
+                "",
                 v.address_line1,
                 v.address_line2,
                 v.city,

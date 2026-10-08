@@ -306,6 +306,55 @@ def test_fx_refresh_rejects_a_bad_date(cli, capsys):
     assert "YYYY-MM-DD" in capsys.readouterr().out
 
 
+def test_status_considering_shows_up_as_might_buy(cli, capsys):
+    run(cli, "add", "--brand", "Apple", "--product", "iPhone 15")
+    run(cli, "add", "--vendor", "Amazon")
+    run(
+        cli,
+        "add",
+        "--vendor",
+        "Amazon",
+        "--product",
+        "iPhone 15",
+        "--quote",
+        "40",
+    )
+    capsys.readouterr()
+
+    assert not run(cli, "status", "set", "1", "considering")
+    capsys.readouterr()
+
+    assert not run(cli, "purchase-list", "might-buy")
+    out = capsys.readouterr().out
+    assert "iPhone 15" in out
+    assert "Considering" in out
+
+
+def test_status_ordered_shows_up_in_spend(cli, capsys):
+    """Marking a quote ordered records the purchase spend reports."""
+    run(cli, "add", "--brand", "Apple", "--product", "iPhone 15")
+    run(cli, "add", "--vendor", "Amazon")
+    run(
+        cli,
+        "add",
+        "--vendor",
+        "Amazon",
+        "--product",
+        "iPhone 15",
+        "--quote",
+        "40",
+    )
+    capsys.readouterr()
+
+    assert not run(cli, "status", "set", "1", "ordered")
+    capsys.readouterr()
+
+    assert not run(cli, "spend")
+    out = capsys.readouterr().out
+    assert "quote-1" in out or "$40.00" in out
+    assert "$40.00" in out
+
+
 def test_spend_on_an_empty_database(cli, capsys):
     assert not run(cli, "spend")
     assert "No purchase orders found" in capsys.readouterr().out

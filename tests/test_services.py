@@ -209,7 +209,7 @@ def test_vendor_service_create_with_enhanced_fields(dbsession):
     assert vendor.contact_person == "John Smith"
     assert vendor.email == "john@acme.com"
     assert vendor.phone == "+1-555-1234"
-    assert vendor.website == "https://acme.com"
+    assert vendor.url == "https://acme.com"
     assert vendor.address_line1 == "123 Main St"
     assert vendor.address_line2 == "Suite 100"
     assert vendor.city == "New York"
@@ -218,6 +218,22 @@ def test_vendor_service_create_with_enhanced_fields(dbsession):
     assert vendor.country == "USA"
     assert vendor.tax_id == "12-3456789"
     assert vendor.payment_terms == "Net 30"
+
+
+def test_vendor_website_is_stored_as_url(dbsession):
+    """``website`` is the old name for the one vendor link."""
+    vendor = VendorService.create(dbsession, "Acme", website="https://acme.com")
+    assert vendor.url == "https://acme.com"
+
+
+def test_vendor_url_and_website_must_agree(dbsession):
+    with pytest.raises(ValidationError, match="one link"):
+        VendorService.create(
+            dbsession,
+            "Acme",
+            url="https://acme.com",
+            website="https://other.example",
+        )
 
 
 def test_vendor_service_create_validates_email(dbsession):

@@ -155,3 +155,36 @@ async def test_forex_handler_rejects_duplicate_rate(tui):
         await pilot.pause()
 
         assert app.query_one("#forex-table", DataTable).row_count == 1
+
+
+async def test_watchlist_handler_stores_the_target_currency(seeded):
+    from buylog.services import WatchlistService
+
+    app = seeded.BuyerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._on_watchlist_added(("iPhone 15", 800.0, None, "eur"))
+        await pilot.pause()
+
+        (entry,) = WatchlistService.get_all(app.session)
+        assert entry.target_currency == "EUR"
+        assert entry.target_label == "800.00 EUR"
+
+
+async def test_watchlist_form_returns_the_currency(seeded):
+    from textual.widgets import Input
+
+    app = seeded.BuyerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        results = []
+        screen = seeded.AddWatchlistScreen()
+        await app.push_screen(screen, results.append)
+        await pilot.pause()
+        screen.query_one("#product-name", Input).value = "iPhone 15"
+        screen.query_one("#target-price", Input).value = "800"
+        screen.query_one("#currency", Input).value = " EUR "
+        screen.action_save()
+        await pilot.pause()
+
+        assert results == [("iPhone 15", 800.0, None, "EUR")]

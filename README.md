@@ -113,13 +113,16 @@ buylog purchase-list add "My List" 123               # Add quote to list
 buylog purchase-list remove "My List" 123            # Remove quote from list
 buylog purchase-list show "My List"                  # Show list contents
 buylog purchase-list all                             # List all purchase lists
+buylog purchase-list might-buy                       # Quotes you might buy
 buylog purchase-list delete "My List"                # Delete a list
 
 # Quote status tracking
-buylog status set 123 considering                    # Set quote status
-buylog status set 123 ordered                        # Mark as ordered
+buylog status set 123 considering                    # Put the quote on the Considering list
+buylog status set 123 ordered                        # Mark as ordered, and record a purchase order
 buylog status set 123 received                       # Mark as received
 buylog status list ordered                           # List quotes by status
+# ordered and received ensure one purchase order for that quote (numbered
+# quote-<id> when none exists), so the purchase shows up in `buylog spend`.
 
 # Notes
 buylog note add product 1 "Great product!"           # Add note to product
@@ -136,7 +139,9 @@ buylog tag list --entity-type product --entity-id 1  # List tags for entity
 buylog tag search "sale"                             # Find entities by tag
 
 # Watchlist
-buylog watchlist add "iPhone 15" --target-price 800  # Add to watchlist
+buylog watchlist add "iPhone 15" --target-price 800  # Price target
+buylog watchlist add "iPhone 15" --target-price 800 --currency EUR
+buylog watchlist add "iPhone 15"                     # No target: quotes go on Considering
 buylog watchlist list                                # List active watchlist
 buylog watchlist list --all                          # Include inactive items
 buylog watchlist update 1 --target-price 750         # Update target price
@@ -410,10 +415,10 @@ make diagram
 # or
 uv run python scripts/gen_diagram.py
 
-# Output: doc/er_model.md  (Mermaid, renders inline on GitHub)
-#         doc/er_model.er  (eralchemy markup)
-#         doc/er_model.dot (Graphviz source)
-#         doc/er_model.svg (only when Graphviz is installed)
+# Output: docs/er_model.md  (Mermaid, renders inline on GitHub)
+#         docs/er_model.er  (eralchemy markup)
+#         docs/er_model.dot (Graphviz source)
+#         docs/er_model.svg (only when Graphviz is installed)
 ```
 
 ### Clean Build Artifacts
@@ -450,7 +455,7 @@ buylog/
 │   ├── test_automation.py # check/fx refresh/scrape refresh/spend tests
 │   ├── test_excel.py    # Excel import/export tests
 │   └── test_quote_analysis.py # Quote analysis feature tests
-├── doc/                 # Documentation
+├── docs/                # Documentation
 │   ├── er_model.md      # Auto-generated ER diagram (Mermaid)
 │   ├── er_model.er      # Auto-generated ER diagram (eralchemy)
 │   └── er_model.dot     # Auto-generated ER diagram (Graphviz)
@@ -509,7 +514,7 @@ Key relationships:
 
 - One-to-many from Product to Watchlist
 
-See the auto-generated ER diagram: [`doc/er_model.md`](doc/er_model.md)
+See the auto-generated ER diagram: [`docs/er_model.md`](docs/er_model.md)
 
 ### Service Layer
 

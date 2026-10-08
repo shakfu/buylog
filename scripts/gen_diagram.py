@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Generate the entity-relationship diagram for buylog into doc/.
+Generate the entity-relationship diagram for buylog into docs/.
 
 Always writes the text formats, which need nothing beyond eralchemy:
 
-    doc/er_model.md   Mermaid ER diagram (renders inline on GitHub)
-    doc/er_model.er   eralchemy markup
-    doc/er_model.dot  Graphviz dot source
+    docs/er_model.md   Mermaid ER diagram (renders inline on GitHub)
+    docs/er_model.er   eralchemy markup
+    docs/er_model.dot  Graphviz dot source
 
 The SVG additionally needs Graphviz (the `dot` binary plus pygraphviz or
 graphviz). It is written when they are available and skipped with a clear
@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DOC_DIR = PROJECT_ROOT / "doc"
+DOC_DIR = PROJECT_ROOT / "docs"
 
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 

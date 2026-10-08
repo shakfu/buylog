@@ -112,6 +112,55 @@ def test_migrations_add_a_unique_constraint_to_an_existing_table(fresh_engine):
     assert ("code", "date") in unique_indexes
 
 
+def test_migrations_fold_vendor_website_into_url(fresh_engine):
+    """An older vendor row keeps its link, and the website column goes away."""
+    from sqlalchemy import text
+    from sqlalchemy.orm import Session
+
+    with fresh_engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE vendor ("
+                "id INTEGER PRIMARY KEY, name TEXT, currency TEXT, "
+                "discount_code TEXT, discount REAL, url TEXT, "
+                "contact_person TEXT, email TEXT, phone TEXT, website TEXT, "
+                "address_line1 TEXT, address_line2 TEXT, city TEXT, state TEXT, "
+                "postal_code TEXT, country TEXT, tax_id TEXT, payment_terms TEXT)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO vendor (name, currency, url, website) VALUES "
+                "('Only site', 'USD', NULL, 'https://only.example'), "
+                "('Both', 'USD', 'https://keep.example', 'https://drop.example')"
+            )
+        )
+
+    run_migrations(fresh_engine)
+
+    columns = {column["name"] for column in inspect(fresh_engine).get_columns("vendor")}
+    assert "website" not in columns
+    with Session(fresh_engine) as session:
+        only_site = session.execute(
+            text("SELECT url FROM vendor WHERE name = 'Only site'")
+        ).scalar_one()
+        both = session.execute(
+            text("SELECT url FROM vendor WHERE name = 'Both'")
+        ).scalar_one()
+        notes = (
+            session.execute(
+                text("SELECT content FROM note WHERE entity_type = 'vendor'")
+            )
+            .scalars()
+            .all()
+        )
+    assert only_site == "https://only.example"
+    assert both == "https://keep.example"
+    # The dropped website survives as a note; the copied one needs none.
+    assert notes == ["Website before migration: https://drop.example"]
+    assert check_migrations(fresh_engine) == []
+
+
 def test_migrations_upgrade_an_older_schema(fresh_engine):
     """An existing database gains new tables, columns and constraints."""
     from sqlalchemy import text

@@ -91,12 +91,13 @@ class Vendor(Object, Base):
     currency: Mapped[str] = mapped_column(String)
     discount_code: Mapped[str | None] = mapped_column(String)
     discount: Mapped[float] = mapped_column(Float, default=0.0)
+    # The vendor's site. Older databases also had a website column; migrate
+    # copies that into url and drops it.
     url: Mapped[str | None] = mapped_column(String, nullable=True)
     # Contact information
     contact_person: Mapped[str | None] = mapped_column(String, nullable=True)
     email: Mapped[str | None] = mapped_column(String, nullable=True)
     phone: Mapped[str | None] = mapped_column(String, nullable=True)
-    website: Mapped[str | None] = mapped_column(String, nullable=True)
     # Address fields
     address_line1: Mapped[str | None] = mapped_column(String, nullable=True)
     address_line2: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -529,12 +530,25 @@ class Watchlist(Base):
         "Product", back_populates="watchlist_entries"
     )
     target_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Currency of target_price. Null means USD, which is what comparisons
+    # assumed before the column existed.
+    target_currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
     notes: Mapped[str | None] = mapped_column(String, nullable=True)
     active: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now())
 
+    @property
+    def target_label(self) -> str:
+        """Target price as the user set it, e.g. ``"$800.00"`` or ``"800.00 EUR"``."""
+        if self.target_price is None:
+            return "-"
+        code = (self.target_currency or "USD").upper()
+        if code == "USD":
+            return f"${self.target_price:.2f}"
+        return f"{self.target_price:.2f} {code}"
+
     def __repr__(self):
-        return f"<Watchlist(product={self.product.name}, target=${self.target_price})>"
+        return f"<Watchlist(product={self.product.name}, target={self.target_label})>"
 
 
 def init_db(engine) -> None:

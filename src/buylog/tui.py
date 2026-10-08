@@ -374,7 +374,9 @@ class AddPurchaseListScreen(Screen[tuple[str, str | None] | None]):
         self.dismiss(None)
 
 
-class AddWatchlistScreen(Screen[tuple[str, float | None, str | None] | None]):
+class AddWatchlistScreen(
+    Screen[tuple[str, float | None, str | None, str | None] | None]
+):
     """Full-screen form for adding a product to watchlist."""
 
     BINDINGS = [
@@ -392,6 +394,9 @@ class AddWatchlistScreen(Screen[tuple[str, float | None, str | None] | None]):
             with Horizontal(classes="form-row"):
                 yield Label("Target Price", classes="form-label")
                 yield Input(placeholder="Optional target price", id="target-price")
+            with Horizontal(classes="form-row"):
+                yield Label("Currency", classes="form-label")
+                yield Input(placeholder="USD", id="currency")
             with Horizontal(classes="form-row"):
                 yield Label("Notes", classes="form-label")
                 yield Input(placeholder="Optional notes", id="notes")
@@ -413,12 +418,13 @@ class AddWatchlistScreen(Screen[tuple[str, float | None, str | None] | None]):
         product = self.query_one("#product-name", Input).value
         target_str = self.query_one("#target-price", Input).value
         notes = self.query_one("#notes", Input).value or None
+        currency = self.query_one("#currency", Input).value.strip() or None
         if not product:
             self.notify("Product name is required", severity="error")
             return
         try:
             target = float(target_str) if target_str else None
-            self.dismiss((product, target, notes))
+            self.dismiss((product, target, notes, currency))
         except ValueError:
             self.notify("Invalid target price", severity="error")
 
@@ -828,9 +834,6 @@ class AddVendorScreen(Screen[dict | None]):
                 with Horizontal(classes="form-row"):
                     yield Label("Phone", classes="form-label")
                     yield Input(placeholder="+1 555-1234", id="phone")
-                with Horizontal(classes="form-row"):
-                    yield Label("Website", classes="form-label")
-                    yield Input(placeholder="https://...", id="website")
 
                 # Address
                 yield Label("[bold]Address[/bold]", classes="section-header")
@@ -880,7 +883,6 @@ class AddVendorScreen(Screen[dict | None]):
             "contact_person": self.query_one("#contact-person", Input).value or None,
             "email": self.query_one("#email", Input).value or None,
             "phone": self.query_one("#phone", Input).value or None,
-            "website": self.query_one("#website", Input).value or None,
             "address_line1": self.query_one("#address-line1", Input).value or None,
             "address_line2": self.query_one("#address-line2", Input).value or None,
             "city": self.query_one("#city", Input).value or None,
@@ -1753,7 +1755,7 @@ class BuyerApp(App):
             if filter_by and filter_by.lower() not in w.product.name.lower():
                 continue
 
-            target = f"${w.target_price:.2f}" if w.target_price else "-"
+            target = w.target_label
             notes = w.notes or "-"
             if len(notes) > 25:
                 notes = notes[:22] + "..."
@@ -1873,7 +1875,6 @@ class BuyerApp(App):
                     contact_person=result["contact_person"],
                     email=result["email"],
                     phone=result["phone"],
-                    website=result["website"],
                     address_line1=result["address_line1"],
                     address_line2=result["address_line2"],
                     city=result["city"],
@@ -2063,14 +2064,26 @@ class BuyerApp(App):
                 self.notify(str(e), severity="error")
 
     def _on_watchlist_added(
-        self, result: tuple[str, float | None, str | None] | None
+        self, result: tuple[str, float | None, str | None, str | None] | None
     ) -> None:
         if result:
-            product_name, target_price, notes = result
+            product_name, target_price, notes, currency = result
             try:
-                WatchlistService.create(self.session, product_name, target_price, notes)
-                self.notify(f"Added '{product_name}' to watchlist")
-                self._refresh_watchlist()
+                if target_price is None:
+                    quotes = PurchaseListService.consider_product(
+                        self.session, product_name
+                    )
+                    self.notify(
+                        f"Added {len(quotes)} quote(s) for '{product_name}' "
+                        "to Considering"
+                    )
+                    self._refresh_lists()
+                else:
+                    WatchlistService.create(
+                        self.session, product_name, target_price, notes, currency
+                    )
+                    self.notify(f"Added '{product_name}' to watchlist")
+                    self._refresh_watchlist()
             except NotFoundError as e:
                 self.notify(str(e), severity="error")
             except DuplicateError as e:

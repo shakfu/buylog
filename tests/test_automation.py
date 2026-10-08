@@ -9,13 +9,15 @@ import datetime
 
 import pytest
 
-from buylog.models import Forex, PriceAlert
+from buylog.models import Forex, PriceAlert, Watchlist
 from buylog.services import (
     ForexRefreshService,
     MonitorService,
     ProductService,
     PurchaseOrderService,
     QuoteService,
+    SpecificationService,
+    TagService,
     ScrapeRefreshService,
     ServiceError,
     SpendAnalyticsService,
@@ -166,10 +168,52 @@ def test_check_reports_a_met_watchlist_target(dbsession):
     assert "Watchlist" in findings["messages"][0]
 
 
+def test_check_converts_a_foreign_watchlist_target(dbsession):
+    """100 EUR at 1.25 is $125, so a $110 price meets the target."""
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.25))
+    dbsession.commit()
+    VendorService.create(dbsession, "Amazon")
+    QuoteService.create(dbsession, "Amazon", "iPhone 15", 110.0, brand_name="Apple")
+    WatchlistService.create(
+        dbsession, "iPhone 15", target_price=100.0, target_currency="EUR"
+    )
+
+    findings = MonitorService.check(dbsession)
+
+    assert len(findings["watchlist"]) == 1
+    assert "100.00 EUR" in findings["messages"][0]
+
+
+def test_check_does_not_treat_a_foreign_target_as_dollars(dbsession):
+    """100 EUR at 0.50 is $50. A $90 price is under 100 and over $50."""
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=0.5))
+    dbsession.commit()
+    VendorService.create(dbsession, "Amazon")
+    QuoteService.create(dbsession, "Amazon", "iPhone 15", 90.0, brand_name="Apple")
+    WatchlistService.create(
+        dbsession, "iPhone 15", target_price=100.0, target_currency="EUR"
+    )
+
+    assert MonitorService.check(dbsession)["watchlist"] == []
+
+
+def test_check_skips_a_watchlist_target_with_no_rate(dbsession):
+    VendorService.create(dbsession, "Amazon")
+    QuoteService.create(dbsession, "Amazon", "iPhone 15", 50.0, brand_name="Apple")
+    WatchlistService.create(
+        dbsession, "iPhone 15", target_price=100.0, target_currency="EUR"
+    )
+
+    assert MonitorService.check(dbsession)["watchlist"] == []
+
+
 def test_check_ignores_a_watchlist_entry_without_a_target(dbsession):
+    """A row left over with no target is not a price check."""
     VendorService.create(dbsession, "Amazon")
     QuoteService.create(dbsession, "Amazon", "iPhone 15", 750.0, brand_name="Apple")
-    WatchlistService.create(dbsession, "iPhone 15")
+    product = ProductService.get_by_name(dbsession, "iPhone 15")
+    dbsession.add(Watchlist(product_id=product.id, target_price=None, active=1))
+    dbsession.commit()
 
     assert MonitorService.check(dbsession)["watchlist"] == []
 
@@ -348,6 +392,39 @@ def test_spend_by_category(spending):
         "laptops": pytest.approx(2000.0),
         "phones": pytest.approx(1800.0),
     }
+
+
+def test_spend_uses_a_tag_when_the_product_has_no_category(dbsession):
+    VendorService.create(dbsession, "Amazon")
+    product = ProductService.create(dbsession, "Lens", "Sony")
+    TagService.add_to_entity(dbsession, "cameras", "product", product.id)
+    PurchaseOrderService.create(dbsession, "PO-LENS", "Amazon", "Lens", 400.0)
+
+    rows = SpendAnalyticsService.spend_by_category(dbsession)
+    assert rows == [{"category": "cameras", "total": pytest.approx(400.0), "orders": 1}]
+
+
+def test_spend_uses_a_specification_when_the_product_has_no_category(dbsession):
+    VendorService.create(dbsession, "Amazon")
+    product = ProductService.create(dbsession, "Body", "Sony")
+    spec = SpecificationService.create(dbsession, "Cameras")
+    product.specification = spec
+    dbsession.commit()
+    PurchaseOrderService.create(dbsession, "PO-BODY", "Amazon", "Body", 900.0)
+
+    rows = SpendAnalyticsService.spend_by_category(dbsession)
+    assert rows[0]["category"] == "Cameras"
+    assert rows[0]["total"] == pytest.approx(900.0)
+
+
+def test_spend_prefers_category_over_a_tag(dbsession):
+    VendorService.create(dbsession, "Amazon")
+    product = ProductService.create(dbsession, "Lens", "Sony", category="optics")
+    TagService.add_to_entity(dbsession, "cameras", "product", product.id)
+    PurchaseOrderService.create(dbsession, "PO-OPT", "Amazon", "Lens", 400.0)
+
+    rows = SpendAnalyticsService.spend_by_category(dbsession)
+    assert rows[0]["category"] == "optics"
 
 
 def test_spend_respects_a_date_range(spending):

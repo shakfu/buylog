@@ -190,7 +190,7 @@ def test_vendor_enhanced_fields(dbsession):
         contact_person="John Smith",
         email="john@acme.com",
         phone="+1-555-1234",
-        website="https://acme.com",
+        url="https://acme.com",
         address_line1="123 Main St",
         address_line2="Suite 100",
         city="New York",
@@ -208,7 +208,7 @@ def test_vendor_enhanced_fields(dbsession):
     assert result.contact_person == "John Smith"
     assert result.email == "john@acme.com"
     assert result.phone == "+1-555-1234"
-    assert result.website == "https://acme.com"
+    assert result.url == "https://acme.com"
     assert result.address_line1 == "123 Main St"
     assert result.address_line2 == "Suite 100"
     assert result.city == "New York"
@@ -230,7 +230,7 @@ def test_vendor_enhanced_fields_nullable(dbsession):
     assert result.contact_person is None
     assert result.email is None
     assert result.phone is None
-    assert result.website is None
+    assert result.url is None
     assert result.address_line1 is None
     assert result.address_line2 is None
     assert result.city is None

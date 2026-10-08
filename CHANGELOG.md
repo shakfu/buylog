@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Upgrading
+
+`watchlist.target_currency` is a new nullable column, and `vendor.website` is removed. Run:
+
+```sh
+buylog migrate
+```
+
+Existing watchlist rows keep working. A missing currency is treated as USD, which is what the old comparison assumed.
+
+A vendor's `website` is copied into `url` when `url` is blank, and the column is then dropped. When both were set and differ, `url` remains and the old website is kept as a vendor note.
+
+### Fixed
+
+- **Marking a quote ordered or received did not record a purchase.** `buylog spend` reads purchase orders, and `QuoteService.set_status` only wrote the quote's status, so a purchase recorded with `buylog status set` never appeared in spend. `ordered` and `received` now ensure one active purchase order for that quote, created as `quote-<id>` when none exists, with a total that includes the quote's discount, shipping, and tax. An existing order is advanced when the new status is further along, and is not moved backwards, so a shipped order stays shipped. A quote with an active order cannot be set back to `considering`; cancel the order first.
+
+- **Watchlist targets were compared to USD prices as bare numbers.** A target of 100 EUR was treated as $100. Targets now store a currency, and `MonitorService` converts them with `ForexService.to_usd`, the same path price alerts use. A target whose currency has no rate on file is skipped. `buylog watchlist add` and `update` take `--currency` (default USD), and the TUI watchlist form has a Currency field.
+
+### Changed
+
+- **One answer for what you might buy.** A purchase list of quotes is that answer. `buylog purchase-list might-buy` lists quotes that are on a list and not yet ordered or received. Adding a quote to a list marks it `considering`. Removing it from its last list clears that status. `buylog status set considering` puts the quote on a list named Considering. `buylog watchlist add` without `--target-price` does the same for every quote of that product, instead of storing a second flag. A watchlist entry still needs a target price; that remains the price threshold.
+
+- **Compare and spend share one product classification.** The label is `Product.category` when it is set, otherwise the specification name, otherwise the product's tags. A product filed only with a tag or a specification now shows up in `buylog compare --category` and `buylog spend category`. A category that is already set stays the label, so a tag does not split the same purchase across two buckets.
+
+- **A vendor has one link.** `url` is the stored field. `VendorService.create` still accepts `website`, and the YAML template and vendor spreadsheet still have that column, so older files import. The two values have to be the same string when both are present. The vendor form no longer asks for a website separately.
+
 ## [0.2.0]
 
 ### Upgrading

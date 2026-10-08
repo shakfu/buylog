@@ -36,7 +36,6 @@ class VendorFactory(factory.alchemy.SQLAlchemyModelFactory):
     contact_person = factory.Faker("name")
     email = factory.Faker("email")
     phone = factory.Faker("phone_number")
-    website = factory.Faker("url")
     address_line1 = factory.Faker("street_address")
     address_line2 = factory.Faker("secondary_address")
     city = factory.Faker("city")

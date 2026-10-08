@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Iterator
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -39,8 +39,14 @@ from .models import (
     PurchaseOrder,
     QUOTE_STATUSES,
     SPEC_DATA_TYPES,
+    QUOTE_STATUS_CONSIDERING,
+    QUOTE_STATUS_ORDERED,
+    QUOTE_STATUS_RECEIVED,
     PO_STATUSES,
     PO_STATUS_PENDING,
+    PO_STATUS_APPROVED,
+    PO_STATUS_ORDERED,
+    PO_STATUS_SHIPPED,
     PO_STATUS_RECEIVED,
     PO_STATUS_CANCELLED,
 )
@@ -401,6 +407,29 @@ class ProductService:
         return product
 
     @staticmethod
+    def report_classification(
+        product: Product, tag_names: Optional[List[str]] = None
+    ) -> Optional[str]:
+        """
+        The one label compare and spend use for a product.
+
+        ``category`` wins when it is set. Otherwise the specification name,
+        otherwise the product's tags. A tag or a spec is invisible to those
+        reports only when a category is already set.
+        """
+        if product.category and product.category.strip():
+            return product.category.strip()
+        specification = product.specification
+        if specification is not None and specification.name:
+            return specification.name
+        names = sorted(name for name in (tag_names or []) if name)
+        if not names:
+            return None
+        if len(names) == 1:
+            return names[0]
+        return ", ".join(names)
+
+    @staticmethod
     def get_by_name(session: Session, name: str) -> Optional[Product]:
         """Get a product by name."""
         return Product.by_name(session, name)
@@ -520,6 +549,19 @@ class ProductService:
         logger.info(f"Deleted product: {name}")
 
 
+def _one_vendor_link(url: Optional[str], website: Optional[str]) -> Optional[str]:
+    """The single link for a vendor. ``website`` is the old name for ``url``."""
+    url = url.strip() if isinstance(url, str) else None
+    website = website.strip() if isinstance(website, str) else None
+    url = url or None
+    website = website or None
+    if url and website and url != website:
+        raise ValidationError(
+            f"A vendor has one link. url ({url}) and website ({website}) differ."
+        )
+    return url or website
+
+
 class VendorService:
     """Service for vendor-related business logic"""
 
@@ -557,7 +599,8 @@ class VendorService:
             contact_person: Optional contact person name
             email: Optional email address
             phone: Optional phone number
-            website: Optional website URL
+            website: Old name for ``url``. Stored in ``url``. Both may be passed
+                when they are the same string.
             address_line1: Optional street address line 1
             address_line2: Optional street address line 2
             city: Optional city
@@ -589,6 +632,10 @@ class VendorService:
         if email and "@" not in email:
             raise ValidationError("Invalid email address format")
 
+        # url and website were two columns for one link. Callers may still
+        # pass either name. They have to agree when both are set.
+        url = _one_vendor_link(url, website)
+
         # Check for duplicate
         existing = Vendor.by_name(session, name)
         if existing:
@@ -605,7 +652,6 @@ class VendorService:
                 contact_person=contact_person,
                 email=email,
                 phone=phone,
-                website=website,
                 address_line1=address_line1,
                 address_line2=address_line2,
                 city=city,
@@ -966,6 +1012,11 @@ class QuoteService:
         """
         Set the status of a quote.
 
+        ``ordered`` and ``received`` also ensure a purchase order for the
+        quote, which is what ``buylog spend`` counts. ``considering`` puts
+        the quote on the Considering purchase list. That list membership is
+        what "might buy" means.
+
         Args:
             session: Database session
             quote_id: Quote ID
@@ -988,9 +1039,23 @@ class QuoteService:
         if not quote:
             raise NotFoundError(f"Quote with ID {quote_id} not found")
 
+        if status == QUOTE_STATUS_CONSIDERING:
+            active = PurchaseOrderService.active_for_quote(session, quote.id)
+            if active is not None:
+                raise ValidationError(
+                    f"Quote {quote_id} was bought on order '{active.po_number}'. "
+                    "Cancel that order before marking the quote considering."
+                )
+
         try:
-            quote.status = status
-            session.commit()
+            if status == QUOTE_STATUS_CONSIDERING:
+                PurchaseListService.ensure_considering(session, quote)
+            else:
+                quote.status = status
+                # ordered and received are a purchase. Spend reads purchase
+                # orders, so record one here instead of leaving the status
+                # only on the quote.
+                PurchaseOrderService.ensure_for_quote(session, quote, status)
             logger.info(f"Set status '{status}' for quote {quote_id}")
             return quote
         except SQLAlchemyError as e:
@@ -2071,6 +2136,16 @@ class ProductFeatureService:
 class PurchaseOrderService:
     """Service for purchase order management"""
 
+    # How far along an order is. A quote status only moves an existing
+    # order forward: shipped is not pulled back to ordered.
+    _STATUS_RANK = {
+        PO_STATUS_PENDING: 0,
+        PO_STATUS_APPROVED: 1,
+        PO_STATUS_ORDERED: 2,
+        PO_STATUS_SHIPPED: 3,
+        PO_STATUS_RECEIVED: 4,
+    }
+
     @staticmethod
     def create(
         session: Session,
@@ -2178,6 +2253,10 @@ class PurchaseOrderService:
                 invoice_number=invoice_number,
                 notes=notes,
                 status=status,
+                # Same rule as update_status: received means delivered today.
+                actual_delivery=datetime.date.today()
+                if status == PO_STATUS_RECEIVED
+                else None,
             )
             session.add(po)
             session.commit()
@@ -2249,6 +2328,97 @@ class PurchaseOrderService:
             shipping_cost=effective_shipping,
             tax=tax,
             notes=notes,
+        )
+
+    @staticmethod
+    def _po_number_for_quote(session: Session, quote_id: int) -> str:
+        """A PO number for an order recorded from a quote status change."""
+        base = f"quote-{quote_id}"
+        candidate = base
+        suffix = 2
+        while (
+            session.execute(
+                select(PurchaseOrder.id).where(PurchaseOrder.po_number == candidate)
+            ).scalar_one_or_none()
+            is not None
+        ):
+            candidate = f"{base}-{suffix}"
+            suffix += 1
+        return candidate
+
+    @staticmethod
+    def active_for_quote(session: Session, quote_id: int) -> Optional[PurchaseOrder]:
+        """The oldest purchase order for a quote that is not cancelled."""
+        return (
+            session.execute(
+                select(PurchaseOrder)
+                .where(PurchaseOrder.quote_id == quote_id)
+                .where(PurchaseOrder.status != PO_STATUS_CANCELLED)
+                .order_by(PurchaseOrder.id)
+            )
+            .scalars()
+            .first()
+        )
+
+    @staticmethod
+    def ensure_for_quote(session: Session, quote: Quote, status: str) -> PurchaseOrder:
+        """
+        Make sure this quote has one purchase order that spend can see.
+
+        ``ordered`` and ``received`` mean the quote was bought. Spend reads
+        purchase orders, so those statuses create an order when the quote
+        does not already have an active one. An existing order is advanced
+        when the new status is further along, and left alone otherwise, so a
+        shipped order is not pulled back to ordered. The new order's total
+        follows the quote's total cost: discount, shipping, and tax included.
+
+        Args:
+            session: Database session
+            quote: Quote being marked ordered or received
+            status: ``ordered`` or ``received``
+
+        Returns:
+            The purchase order spend will count
+
+        Raises:
+            ValidationError: If status is not a purchase
+        """
+        if status not in (PO_STATUS_ORDERED, PO_STATUS_RECEIVED):
+            raise ValidationError(f"Cannot record a purchase for status '{status}'")
+
+        existing = PurchaseOrderService.active_for_quote(session, quote.id)
+        if existing is not None:
+            current = PurchaseOrderService._STATUS_RANK.get(existing.status, 0)
+            wanted = PurchaseOrderService._STATUS_RANK[status]
+            if wanted > current:
+                return PurchaseOrderService.update_status(
+                    session, existing.po_number, status
+                )
+            # The quote status change is still uncommitted.
+            session.commit()
+            return existing
+
+        discount = quote.discount or 0.0
+        unit_price = quote.value * (1 - discount / 100.0)
+        shipping = quote.shipping_cost
+        tax_rate = quote.tax_rate or 0.0
+        tax = (
+            (unit_price + (shipping or 0.0)) * (tax_rate / 100.0) if tax_rate else None
+        )
+
+        return PurchaseOrderService.create(
+            session=session,
+            po_number=PurchaseOrderService._po_number_for_quote(session, quote.id),
+            vendor_name=quote.vendor.name,
+            product_name=quote.product.name,
+            unit_price=unit_price,
+            quantity=1,
+            currency=quote.currency or "USD",
+            quote_id=quote.id,
+            order_date=datetime.date.today(),
+            shipping_cost=shipping,
+            tax=tax,
+            status=status,
         )
 
     @staticmethod
@@ -2481,17 +2651,31 @@ class ComparisonService:
         Returns:
             Dict with products in category and their comparison data
         """
+        needle = category.strip().lower()
         products = (
             session.execute(
                 select(Product)
-                .options(joinedload(Product.brand))
-                .where(Product.category.ilike(f"%{category}%"))
+                .options(
+                    joinedload(Product.brand),
+                    joinedload(Product.specification),
+                )
                 .order_by(Product.name)
             )
             .unique()
             .scalars()
             .all()
         )
+        tags = TagService.product_tag_names(session)
+        products = [
+            product
+            for product in products
+            if (
+                label := ProductService.report_classification(
+                    product, tags.get(product.id, [])
+                )
+            )
+            and needle in label.lower()
+        ]
 
         if not products:
             raise NotFoundError(f"No products found in category '{category}'")
@@ -2541,24 +2725,33 @@ class ComparisonService:
         }
 
     @staticmethod
+    def classification_counts(session: Session) -> Dict[str, int]:
+        """How many products use each report classification."""
+        products = (
+            session.execute(select(Product).options(joinedload(Product.specification)))
+            .unique()
+            .scalars()
+            .all()
+        )
+        tags = TagService.product_tag_names(session)
+        counts: Dict[str, int] = {}
+        for product in products:
+            label = ProductService.report_classification(
+                product, tags.get(product.id, [])
+            )
+            if label:
+                counts[label] = counts.get(label, 0) + 1
+        return counts
+
+    @staticmethod
     def get_categories(session: Session) -> List[str]:
         """
-        Get all unique product categories.
+        Get all unique product classifications.
 
         Returns:
             List of category names
         """
-        results = (
-            session.execute(
-                select(Product.category)
-                .where(Product.category.isnot(None))
-                .distinct()
-                .order_by(Product.category)
-            )
-            .scalars()
-            .all()
-        )
-        return [c for c in results if c]
+        return sorted(ComparisonService.classification_counts(session))
 
     @staticmethod
     def set_product_category(
@@ -2588,6 +2781,11 @@ class ComparisonService:
             session.rollback()
             logger.error(f"Failed to set product category: {e}")
             raise ServiceError(f"Failed to set product category: {e}") from e
+
+
+# Quotes on this list are the ones you might buy. Quote status `considering`
+# and a watchlist entry with no target price are derived from it.
+CONSIDERING_LIST = "Considering"
 
 
 class PurchaseListService:
@@ -2675,6 +2873,7 @@ class PurchaseListService:
 
         try:
             purchase_list.quotes.append(quote)
+            PurchaseListService._sync_considering(quote)
             session.commit()
             logger.info(f"Added quote {quote_id} to list '{list_name}'")
             return purchase_list
@@ -2709,6 +2908,8 @@ class PurchaseListService:
 
         try:
             purchase_list.quotes.remove(quote)
+            session.flush()
+            PurchaseListService._sync_considering(quote)
             session.commit()
             logger.info(f"Removed quote {quote_id} from list '{list_name}'")
             return purchase_list
@@ -2725,13 +2926,118 @@ class PurchaseListService:
             raise NotFoundError(f"Purchase list '{name}' not found")
 
         try:
+            quotes = list(purchase_list.quotes)
             session.delete(purchase_list)
+            session.flush()
+            for quote in quotes:
+                session.expire(quote, ["purchase_lists"])
+                PurchaseListService._sync_considering(quote)
             session.commit()
             logger.info(f"Deleted purchase list: {name}")
         except SQLAlchemyError as e:
             session.rollback()
             logger.error(f"Failed to delete purchase list: {e}")
             raise ServiceError(f"Failed to delete purchase list: {e}") from e
+
+    @staticmethod
+    def _sync_considering(quote: Quote) -> None:
+        """
+        Keep ``considering`` aligned with list membership.
+
+        A quote that is already ordered or received stays that way. An
+        unpurchased quote on any list is considering. One that is considering
+        and no longer on a list loses the status.
+        """
+        if quote.status in (QUOTE_STATUS_ORDERED, QUOTE_STATUS_RECEIVED):
+            return
+        if quote.purchase_lists:
+            quote.status = QUOTE_STATUS_CONSIDERING
+        elif quote.status == QUOTE_STATUS_CONSIDERING:
+            quote.status = None
+
+    @staticmethod
+    def _list_named(session: Session, name: str, description: str) -> PurchaseList:
+        purchase_list = PurchaseList.by_name(session, name)
+        if purchase_list is not None:
+            return purchase_list
+        purchase_list = PurchaseList(name=name, description=description)
+        session.add(purchase_list)
+        session.flush()
+        return purchase_list
+
+    @staticmethod
+    def ensure_considering(session: Session, quote: Quote) -> PurchaseList:
+        """Put ``quote`` on the Considering list and mark it considering."""
+        purchase_list = PurchaseListService._list_named(
+            session, CONSIDERING_LIST, "Quotes you might buy"
+        )
+        if quote not in purchase_list.quotes:
+            purchase_list.quotes.append(quote)
+        quote.status = QUOTE_STATUS_CONSIDERING
+        session.commit()
+        logger.info(f"Quote {quote.id} is on '{CONSIDERING_LIST}'")
+        return purchase_list
+
+    @staticmethod
+    def consider_product(session: Session, product_name: str) -> List[Quote]:
+        """
+        Put every quote for a product on the Considering list.
+
+        This is the watchlist add with no target price: a product you might
+        buy, which is a set of quotes, not a second flag.
+        """
+        product = Product.by_name(session, product_name)
+        if not product:
+            raise NotFoundError(f"Product '{product_name}' not found")
+
+        quotes = list(product.quotes)
+        if not quotes:
+            raise ValidationError(
+                f"'{product_name}' has no quotes to consider. Add a quote first."
+            )
+
+        purchase_list = PurchaseListService._list_named(
+            session, CONSIDERING_LIST, "Quotes you might buy"
+        )
+        for quote in quotes:
+            if quote not in purchase_list.quotes:
+                purchase_list.quotes.append(quote)
+            PurchaseListService._sync_considering(quote)
+        session.commit()
+        logger.info(
+            f"Added {len(quotes)} quote(s) for '{product_name}' to '{CONSIDERING_LIST}'"
+        )
+        return quotes
+
+    @staticmethod
+    def might_buy(session: Session) -> List[Quote]:
+        """
+        Quotes you might buy: on a purchase list, and not yet ordered or received.
+
+        This is the one answer. Status ``considering`` and a target-less
+        watchlist entry are written through here rather than stored apart.
+        """
+        quotes = (
+            session.execute(
+                select(Quote)
+                .options(
+                    joinedload(Quote.vendor),
+                    joinedload(Quote.product).joinedload(Product.brand),
+                    joinedload(Quote.purchase_lists),
+                )
+                .where(Quote.purchase_lists.any())
+                .where(
+                    or_(
+                        Quote.status.is_(None),
+                        Quote.status == QUOTE_STATUS_CONSIDERING,
+                    )
+                )
+            )
+            .unique()
+            .scalars()
+            .all()
+        )
+        return sorted(quotes, key=lambda quote: (quote.product.name.lower(), quote.id))
 
 
 class NoteService:
@@ -2901,6 +3207,19 @@ class TagService:
             raise ServiceError(f"Failed to create tag: {e}") from e
 
     @staticmethod
+    def product_tag_names(session: Session) -> Dict[int, List[str]]:
+        """Tag names keyed by product id."""
+        rows = session.execute(
+            select(EntityTag.entity_id, Tag.name)
+            .join(Tag, Tag.id == EntityTag.tag_id)
+            .where(EntityTag.entity_type == "product")
+        ).all()
+        grouped: Dict[int, List[str]] = {}
+        for entity_id, name in rows:
+            grouped.setdefault(entity_id, []).append(name)
+        return grouped
+
+    @staticmethod
     def get_all(session: Session) -> List[Tag]:
         """Get all tags."""
         results = session.execute(select(Tag).order_by(Tag.name)).scalars().all()
@@ -3066,6 +3385,7 @@ class WatchlistService:
         product_name: str,
         target_price: Optional[float] = None,
         notes: Optional[str] = None,
+        target_currency: Optional[str] = None,
     ) -> Watchlist:
         """
         Add a product to the watchlist.
@@ -3075,6 +3395,8 @@ class WatchlistService:
             product_name: Product name
             target_price: Optional target price
             notes: Optional notes
+            target_currency: Currency of ``target_price`` (default USD when a
+                price is set)
 
         Returns:
             Created Watchlist instance
@@ -3082,6 +3404,19 @@ class WatchlistService:
         product = Product.by_name(session, product_name)
         if not product:
             raise NotFoundError(f"Product '{product_name}' not found")
+
+        if target_price is None:
+            raise ValidationError(
+                "A watchlist entry needs a target price. "
+                "To mark quotes you might buy, add them to a purchase list."
+            )
+
+        if target_currency is not None:
+            target_currency = target_currency.strip().upper()
+            if len(target_currency) != 3:
+                raise ValidationError("Currency code must be 3 characters (ISO 4217)")
+        else:
+            target_currency = "USD"
 
         # Check if already on watchlist (and active)
         existing = session.execute(
@@ -3097,6 +3432,7 @@ class WatchlistService:
             watchlist = Watchlist(
                 product_id=product.id,
                 target_price=target_price,
+                target_currency=target_currency,
                 notes=notes,
             )
             session.add(watchlist)
@@ -3145,6 +3481,7 @@ class WatchlistService:
         watchlist_id: int,
         target_price: Optional[float] = None,
         notes: Optional[str] = None,
+        target_currency: Optional[str] = None,
     ) -> Watchlist:
         """
         Update a watchlist entry.
@@ -3154,6 +3491,7 @@ class WatchlistService:
             watchlist_id: Watchlist ID
             target_price: New target price (None to keep existing)
             notes: New notes (None to keep existing)
+            target_currency: Currency of the target price (None to keep existing)
 
         Returns:
             Updated Watchlist instance
@@ -3162,9 +3500,18 @@ class WatchlistService:
         if not watchlist:
             raise NotFoundError(f"Watchlist entry {watchlist_id} not found")
 
+        if target_currency is not None:
+            target_currency = target_currency.strip().upper()
+            if len(target_currency) != 3:
+                raise ValidationError("Currency code must be 3 characters (ISO 4217)")
+
         try:
+            if target_currency is not None:
+                watchlist.target_currency = target_currency
             if target_price is not None:
                 watchlist.target_price = target_price
+                if watchlist.target_currency is None:
+                    watchlist.target_currency = "USD"
             if notes is not None:
                 watchlist.notes = notes
             session.commit()
@@ -5510,7 +5857,23 @@ class MonitorService:
             if entry.target_price is None:
                 continue
             best = best_prices.get(entry.product_id)
-            if best is not None and best.value <= entry.target_price:
+            if best is None:
+                continue
+            # Same conversion as price alerts. A bare comparison treated a
+            # 100 EUR target as $100.
+            code = (entry.target_currency or "USD").upper()
+            try:
+                threshold_usd, _, _ = ForexService.to_usd(
+                    session, entry.target_price, code
+                )
+            except ValidationError:
+                logger.warning(
+                    f"Skipping watchlist {entry.id} for product "
+                    f"{entry.product.name}: no forex rate for target currency "
+                    f"'{code}'"
+                )
+                continue
+            if best.value <= threshold_usd:
                 met_targets.append({"watchlist": entry, "quote": best})
 
         messages: List[str] = []
@@ -5523,9 +5886,10 @@ class MonitorService:
             )
         for item in met_targets:
             entry, quote = item["watchlist"], item["quote"]
+            code = (entry.target_currency or "USD").upper()
             messages.append(
                 f"Watchlist: {quote.product.name} is ${quote.value:.2f} at "
-                f"{quote.vendor.name} (target ${entry.target_price:.2f})"
+                f"{quote.vendor.name} (target {entry.target_price:.2f} {code})"
             )
 
         return {
@@ -5592,6 +5956,7 @@ class SpendAnalyticsService:
         query = select(PurchaseOrder).options(
             joinedload(PurchaseOrder.vendor),
             joinedload(PurchaseOrder.product).joinedload(Product.brand),
+            joinedload(PurchaseOrder.product).joinedload(Product.specification),
             joinedload(PurchaseOrder.quote),
         )
         if statuses:
@@ -5680,10 +6045,16 @@ class SpendAnalyticsService:
         end: Optional[datetime.date] = None,
         statuses: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Total USD spend per product category, highest first."""
+        """Total USD spend per product classification, highest first."""
+        tags = TagService.product_tag_names(session)
         buckets: Dict[str, Dict[str, Any]] = {}
         for po in SpendAnalyticsService._orders(session, start, end, statuses):
-            key = po.product.category or "uncategorized"
+            key = (
+                ProductService.report_classification(
+                    po.product, tags.get(po.product_id, [])
+                )
+                or "uncategorized"
+            )
             bucket = buckets.setdefault(
                 key, {"category": key, "total": 0.0, "orders": 0}
             )

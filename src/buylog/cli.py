@@ -844,6 +844,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Purchase list all
     list_subparsers.add_parser("all", help="List all purchase lists")
 
+    # Quotes you might buy, across every list
+    list_subparsers.add_parser(
+        "might-buy", help="Quotes you might buy, from every purchase list"
+    )
+
     # Status command
     status_parser = subparsers.add_parser("status", help="Manage quote status")
     status_subparsers = status_parser.add_subparsers(
@@ -966,6 +971,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     watchlist_add_parser.add_argument("product", type=str, help="Product name")
     watchlist_add_parser.add_argument("--target-price", type=float, help="Target price")
+    watchlist_add_parser.add_argument(
+        "--currency",
+        type=str,
+        help="Currency of --target-price (default USD)",
+    )
     watchlist_add_parser.add_argument("--notes", type=str, help="Notes")
 
     # Watchlist list
@@ -983,6 +993,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     watchlist_update_parser.add_argument("id", type=int, help="Watchlist entry ID")
     watchlist_update_parser.add_argument(
         "--target-price", type=float, help="New target price"
+    )
+    watchlist_update_parser.add_argument(
+        "--currency",
+        type=str,
+        help="Currency of the target price",
     )
     watchlist_update_parser.add_argument("--notes", type=str, help="New notes")
 
@@ -1811,19 +1826,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     return 1
 
             elif args.category_command == "list":
-                categories = ComparisonService.get_categories(session)
-                if categories:
+                counts = ComparisonService.classification_counts(session)
+                if counts:
                     print("Product Categories:")
-                    for cat in categories:
-                        # Count products in category
-                        count = (
-                            session.execute(
-                                select(Product).where(Product.category == cat)
-                            )
-                            .scalars()
-                            .all()
-                        )
-                        print(f"  - {cat} ({len(count)} products)")
+                    for cat in sorted(counts):
+                        print(f"  - {cat} ({counts[cat]} products)")
                 else:
                     print(
                         "No categories defined. Use 'buylog category set <product> <category>' to add one."
@@ -1926,8 +1933,29 @@ def main(argv: Optional[list[str]] = None) -> int:
                 ]
                 print(tabulate(data, headers=headers, tablefmt="grid"))
 
+            elif args.list_command == "might-buy":
+                quotes = PurchaseListService.might_buy(session)
+                if not quotes:
+                    print("Nothing you might buy")
+                    return 0
+                headers = ["ID", "Vendor", "Product", "Price", "Lists"]
+                data = [
+                    [
+                        quote.id,
+                        quote.vendor.name,
+                        f"{quote.product.brand.name} {quote.product.name}",
+                        quote.display_price,
+                        ", ".join(item.name for item in quote.purchase_lists),
+                    ]
+                    for quote in quotes
+                ]
+                print(tabulate(data, headers=headers, tablefmt="grid"))
+
             else:
-                print("Usage: buylog purchase-list [create|add|remove|show|delete|all]")
+                print(
+                    "Usage: buylog purchase-list "
+                    "[create|add|remove|show|delete|all|might-buy]"
+                )
                 return 1
 
         elif args.command == "status":
@@ -2077,18 +2105,31 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return 1
 
         elif args.command == "watchlist":
-            from .services import WatchlistService
+            from .services import PurchaseListService, WatchlistService
 
             if args.watchlist_command == "add":
                 try:
-                    watchlist = WatchlistService.create(
-                        session,
-                        args.product,
-                        getattr(args, "target_price", None),
-                        getattr(args, "notes", None),
-                    )
-                    print(f"Added '{args.product}' to watchlist (ID: {watchlist.id})")
-                except (NotFoundError, DuplicateError) as e:
+                    target_price = getattr(args, "target_price", None)
+                    if target_price is None:
+                        quotes = PurchaseListService.consider_product(
+                            session, args.product
+                        )
+                        print(
+                            f"Added {len(quotes)} quote(s) for '{args.product}' "
+                            "to the Considering list"
+                        )
+                    else:
+                        watchlist = WatchlistService.create(
+                            session,
+                            args.product,
+                            target_price,
+                            getattr(args, "notes", None),
+                            getattr(args, "currency", None),
+                        )
+                        print(
+                            f"Added '{args.product}' to watchlist (ID: {watchlist.id})"
+                        )
+                except (NotFoundError, DuplicateError, ValidationError) as e:
                     print(f"Error: {e}")
                     return 1
 
@@ -2106,7 +2147,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         w.id,
                         w.product.name,
                         w.product.brand.name,
-                        f"${w.target_price:.2f}" if w.target_price else "-",
+                        w.target_label,
                         (w.notes[:30] + "...")
                         if w.notes and len(w.notes) > 30
                         else (w.notes or "-"),
@@ -2123,9 +2164,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                         args.id,
                         getattr(args, "target_price", None),
                         getattr(args, "notes", None),
+                        getattr(args, "currency", None),
                     )
                     print(f"Updated watchlist entry #{args.id}")
-                except NotFoundError as e:
+                except (NotFoundError, ValidationError) as e:
                     print(f"Error: {e}")
                     return 1
 
@@ -2431,6 +2473,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                             "vendor": item["quote"].vendor.name,
                             "price": item["quote"].value,
                             "target": item["watchlist"].target_price,
+                            "target_currency": item["watchlist"].target_currency
+                            or "USD",
                         }
                         for item in findings["watchlist"]
                     ],

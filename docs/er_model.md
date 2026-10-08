@@ -75,7 +75,6 @@ erDiagram
         string contact_person
         string email
         string phone
-        string website
         string address_line1
         string address_line2
         string city
@@ -151,6 +150,7 @@ erDiagram
         int id PK
         int product_id FK
         float target_price
+        string target_currency
         string notes
         int active
         datetime created_at

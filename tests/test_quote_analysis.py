@@ -8,6 +8,8 @@ from buylog.services import (
     QuoteHistoryService,
     PriceAlertService,
     ComparisonService,
+    SpecificationService,
+    TagService,
     ValidationError,
     NotFoundError,
 )
@@ -482,6 +484,51 @@ class TestComparisonService:
 
         assert result["category"] == "Mobile Phones"
         assert result["total_products"] == 2
+
+    def test_compare_finds_a_product_filed_only_as_a_tag(self, dbsession):
+        VendorService.create(dbsession, "Amazon", currency="USD")
+        product = ProductService.create(dbsession, "Lens", "Sony")
+        TagService.add_to_entity(dbsession, "cameras", "product", product.id)
+        QuoteService.create(dbsession, "Amazon", "Lens", 100.0)
+
+        result = ComparisonService.compare_by_category(dbsession, "cameras")
+
+        assert result["total_products"] == 1
+        assert result["products"][0]["product"].name == "Lens"
+
+    def test_compare_finds_a_product_filed_only_as_a_specification(self, dbsession):
+        VendorService.create(dbsession, "Amazon", currency="USD")
+        product = ProductService.create(dbsession, "Body", "Sony")
+        product.specification = SpecificationService.create(dbsession, "Cameras")
+        dbsession.commit()
+        QuoteService.create(dbsession, "Amazon", "Body", 900.0)
+
+        result = ComparisonService.compare_by_category(dbsession, "Cameras")
+
+        assert result["total_products"] == 1
+        assert result["products"][0]["product"].name == "Body"
+
+    def test_several_tags_form_one_label(self, dbsession):
+        """Tags join into one sorted label, so a product counts once."""
+        ProductService.create(dbsession, "Lens", "Sony")
+        product = ProductService.get_by_name(dbsession, "Lens")
+        TagService.add_to_entity(dbsession, "optics", "product", product.id)
+        TagService.add_to_entity(dbsession, "cameras", "product", product.id)
+
+        assert ComparisonService.classification_counts(dbsession) == {
+            "cameras, optics": 1
+        }
+
+    def test_compare_uses_category_ahead_of_a_tag(self, dbsession):
+        VendorService.create(dbsession, "Amazon", currency="USD")
+        product = ProductService.create(dbsession, "Lens", "Sony", category="optics")
+        TagService.add_to_entity(dbsession, "cameras", "product", product.id)
+        QuoteService.create(dbsession, "Amazon", "Lens", 100.0)
+
+        with pytest.raises(NotFoundError):
+            ComparisonService.compare_by_category(dbsession, "cameras")
+        result = ComparisonService.compare_by_category(dbsession, "optics")
+        assert result["total_products"] == 1
 
     def test_compare_by_category_not_found(self, dbsession):
         """Compare by category with no matches raises error"""

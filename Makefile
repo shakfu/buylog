@@ -12,7 +12,7 @@ coverage:
 	@uv run pytest --cov-report=html:cov_html --cov-report=term-missing --cov=buylog tests
 
 diagram:
-	@echo "generating entity-relation diagram to 'doc' folder"
+	@echo "generating entity-relation diagram to 'docs' folder"
 	@uv run python scripts/gen_diagram.py
 
 lint:
