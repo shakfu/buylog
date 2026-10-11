@@ -10,12 +10,11 @@ erDiagram
     specification ||--o{ specification_feature : specification_id
     brand ||--o{ vendor_brand : brand_id
     vendor ||--o{ vendor_brand : vendor_id
-    product ||--o{ price_alert : product_id
+    product ||--o{ price_target : product_id
     product ||--o{ product_feature : product_id
     specification_feature ||--o{ product_feature : specification_feature_id
     product ||--o{ quote : product_id
     vendor ||--o{ quote : vendor_id
-    product ||--o{ watchlist : product_id
     purchase_list ||--o{ purchase_list_quote : purchase_list_id
     quote ||--o{ purchase_list_quote : quote_id
     product ||--o{ purchase_order : product_id
@@ -41,7 +40,7 @@ erDiagram
         int id PK
         date date
         string code
-        float usd_per_unit
+        float base_per_unit
     }
     note {
         int id PK
@@ -56,6 +55,10 @@ erDiagram
         string name
         string description
         datetime created_at
+    }
+    setting {
+        string key PK
+        string value
     }
     specification {
         string description
@@ -113,11 +116,11 @@ erDiagram
         int vendor_id PK,FK
         int brand_id PK,FK
     }
-    price_alert {
+    price_target {
         int id PK
         int product_id FK
-        float threshold_value
-        string threshold_currency
+        float threshold
+        string currency
         int active
         datetime created_at
         datetime triggered_at
@@ -134,7 +137,6 @@ erDiagram
         int id PK
         int product_id FK
         int vendor_id FK
-        string currency
         float value
         float original_value
         string original_currency
@@ -142,18 +144,8 @@ erDiagram
         float shipping_cost
         float tax_rate
         datetime created_at
-        string status
         string receipt_path
         string source_url
-    }
-    watchlist {
-        int id PK
-        int product_id FK
-        float target_price
-        string target_currency
-        string notes
-        int active
-        datetime created_at
     }
     purchase_list_quote {
         int purchase_list_id PK,FK
@@ -176,7 +168,7 @@ erDiagram
         float shipping_cost
         float tax
         float grand_total
-        float grand_total_usd
+        float grand_total_base
         string invoice_number
         string notes
         datetime created_at

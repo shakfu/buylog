@@ -3,8 +3,14 @@
 Simple database migration for buylog.
 
 Compares SQLAlchemy models to actual database schema and applies changes.
-New tables and columns are added. The one removal is ``vendor.website``,
-which is copied into ``vendor.url`` (or a vendor note) and then dropped.
+New tables and columns are added. Two removals copy data before dropping:
+
+- ``vendor.website`` goes into ``vendor.url``, or a vendor note.
+- ``price_alert`` and ``watchlist`` go into ``price_target``.
+- ``quote.status`` goes into purchase orders and the Considering list.
+- ``quote.currency``, always USD, is dropped; any other value becomes a note.
+
+Columns in ``RENAMED_COLUMNS`` are renamed in place, so their data is kept.
 """
 
 import logging
@@ -20,6 +26,28 @@ logger = logging.getLogger("buylog")
 
 class MigrationError(Exception):
     """Raised when one or more migration statements could not be applied."""
+
+
+# (table, old name, new name). The amounts were always relative to the base
+# currency; the old names said USD.
+RENAMED_COLUMNS = [
+    ("forex", "usd_per_unit", "base_per_unit"),
+    ("purchase_order", "grand_total_usd", "grand_total_base"),
+]
+
+
+def rename_statements(engine: Engine) -> list[str]:
+    """Rename columns whose old name is still in the database."""
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    statements = []
+    for table, old, new in RENAMED_COLUMNS:
+        if table not in tables:
+            continue
+        columns = {c["name"] for c in inspector.get_columns(table)}
+        if old in columns and new not in columns:
+            statements.append(f"ALTER TABLE {table} RENAME COLUMN {old} TO {new}")
+    return statements
 
 
 def _unique_constraints(table: Any) -> list[dict[str, Any]]:
@@ -219,8 +247,13 @@ def generate_migrations(engine: Engine) -> list[str]:
         else:
             # Check for missing columns
             db_columns = db_tables[table_name]["columns"]
+            renamed_to = {
+                new
+                for table, old, new in RENAMED_COLUMNS
+                if table == table_name and old in db_columns
+            }
             for col_name, col_def in table_def["columns"].items():
-                if col_name not in db_columns:
+                if col_name not in db_columns and col_name not in renamed_to:
                     sqlite_type = get_sqlite_type(col_def["type"])
                     alter_sql = (
                         f"ALTER TABLE {table_name} ADD COLUMN {col_name} {sqlite_type}"
@@ -269,9 +302,177 @@ def vendor_website_statements(engine: Engine) -> list[str]:
     ]
 
 
+def price_target_statements(engine: Engine) -> list[str]:
+    """
+    Copy ``price_alert`` and ``watchlist`` into ``price_target``, then drop them.
+
+    A watchlist row with notes keeps them as a product note. A row with no
+    target was only a flag that the product might be bought, so its quotes
+    go on the Considering purchase list. Copied watchlist targets start
+    armed: they used to fire on every check, so none has been "used up".
+    """
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    statements: list[str] = []
+    # Rows for a deleted product would fail the foreign key; they are dropped.
+    live = "product_id IN (SELECT id FROM product)"
+
+    if "price_alert" in tables:
+        columns = {c["name"] for c in inspector.get_columns("price_alert")}
+        currency = (
+            "upper(coalesce(threshold_currency, 'USD'))"
+            if "threshold_currency" in columns
+            else "'USD'"
+        )
+        statements += [
+            "INSERT INTO price_target "
+            "(product_id, threshold, currency, active, created_at, triggered_at) "
+            f"SELECT product_id, threshold_value, {currency}, coalesce(active, 1), "
+            "coalesce(created_at, CURRENT_TIMESTAMP), triggered_at FROM price_alert "
+            f"WHERE threshold_value IS NOT NULL AND {live}",
+            "DROP TABLE price_alert",
+        ]
+
+    if "watchlist" in tables:
+        columns = {c["name"] for c in inspector.get_columns("watchlist")}
+        # target_currency arrived after 0.2.0; a missing value meant USD.
+        currency = (
+            "upper(coalesce(target_currency, 'USD'))"
+            if "target_currency" in columns
+            else "'USD'"
+        )
+        flagged = (
+            "SELECT q.id FROM quote q JOIN watchlist w ON w.product_id = q.product_id "
+            "WHERE w.target_price IS NULL AND coalesce(w.active, 1) = 1"
+        )
+        statements += [
+            "INSERT INTO price_target "
+            "(product_id, threshold, currency, active, created_at) "
+            f"SELECT product_id, target_price, {currency}, coalesce(active, 1), "
+            "coalesce(created_at, CURRENT_TIMESTAMP) FROM watchlist "
+            f"WHERE target_price IS NOT NULL AND {live}",
+            "INSERT INTO note (entity_type, entity_id, content, created_at) "
+            "SELECT 'product', product_id, 'Watchlist note: ' || trim(notes), "
+            "coalesce(created_at, CURRENT_TIMESTAMP) FROM watchlist "
+            f"WHERE notes IS NOT NULL AND trim(notes) != '' AND {live}",
+            *_considering_statements(flagged),
+            "DROP TABLE watchlist",
+        ]
+
+    return statements
+
+
+def _considering_statements(quote_ids: str) -> list[str]:
+    """Put the quotes that ``quote_ids`` (a SELECT of ids) names on Considering."""
+    return [
+        "INSERT INTO purchase_list (name, description, created_at) "
+        "SELECT 'Considering', 'Quotes you might buy', CURRENT_TIMESTAMP "
+        f"WHERE EXISTS ({quote_ids}) "
+        "AND NOT EXISTS (SELECT 1 FROM purchase_list WHERE name = 'Considering')",
+        "INSERT OR IGNORE INTO purchase_list_quote (purchase_list_id, quote_id) "
+        "SELECT pl.id, f.id FROM purchase_list pl "
+        f"JOIN ({quote_ids}) f WHERE pl.name = 'Considering'",
+    ]
+
+
+def quote_status_statements(engine: Engine) -> list[str]:
+    """
+    Turn a stored ``quote.status`` into the records it is derived from, then drop it.
+
+    ``ordered``/``received`` with no purchase order at all gets one, priced
+    the way ``PurchaseOrderService.ensure_for_quote`` prices it. A quote whose
+    only orders are cancelled gets none: the cancel was the later decision.
+    ``considering`` on no list goes on the Considering list.
+    """
+    inspector = inspect(engine)
+    if "quote" not in inspector.get_table_names():
+        return []
+    if "status" not in {c["name"] for c in inspector.get_columns("quote")}:
+        return []
+
+    unit = "q.value * (1 - coalesce(q.discount, 0) / 100.0)"
+    shipping = "coalesce(q.shipping_cost, 0)"
+    tax = (
+        f"CASE WHEN coalesce(q.tax_rate, 0) > 0 "
+        f"THEN ({unit} + {shipping}) * q.tax_rate / 100.0 END"
+    )
+    total = f"{unit} + {shipping} + coalesce({tax}, 0)"
+    po_number = (
+        "CASE WHEN EXISTS (SELECT 1 FROM purchase_order x "
+        "WHERE x.po_number = 'quote-' || q.id) "
+        "THEN 'quote-' || q.id || '-migrated' ELSE 'quote-' || q.id END"
+    )
+    unlisted = (
+        "SELECT q.id FROM quote q WHERE q.status = 'considering' "
+        "AND NOT EXISTS (SELECT 1 FROM purchase_list_quote x WHERE x.quote_id = q.id)"
+    )
+    return [
+        "INSERT INTO purchase_order (quote_id, vendor_id, product_id, po_number, "
+        "status, quantity, unit_price, currency, total_amount, shipping_cost, tax, "
+        "grand_total, grand_total_base, notes, created_at) "
+        f"SELECT q.id, q.vendor_id, q.product_id, {po_number}, q.status, 1, "
+        f"{unit}, 'USD', {unit}, q.shipping_cost, {tax}, {total}, {total}, "
+        "'Recorded by migration from the quote status', "
+        "coalesce(q.created_at, CURRENT_TIMESTAMP) FROM quote q "
+        "WHERE q.status IN ('ordered', 'received') "
+        "AND NOT EXISTS (SELECT 1 FROM purchase_order x WHERE x.quote_id = q.id)",
+        *_considering_statements(unlisted),
+        *_drop_column_statements(inspector, "quote", "status"),
+    ]
+
+
+def quote_currency_statements(engine: Engine) -> list[str]:
+    """
+    Drop ``quote.currency``. ``quote.value`` is USD; the entered currency is
+    ``original_currency``. Every service path wrote USD. A row that says
+    otherwise came from ``Vendor.add_product``, and its value is kept as a
+    quote note before the column goes.
+    """
+    inspector = inspect(engine)
+    if "quote" not in inspector.get_table_names():
+        return []
+    if "currency" not in {c["name"] for c in inspector.get_columns("quote")}:
+        return []
+    return [
+        "INSERT INTO note (entity_type, entity_id, content, created_at) "
+        "SELECT 'quote', id, 'Currency before migration: ' || currency, "
+        "CURRENT_TIMESTAMP FROM quote "
+        "WHERE currency IS NOT NULL AND upper(currency) != 'USD'",
+        *_drop_column_statements(inspector, "quote", "currency"),
+    ]
+
+
+def _drop_column_statements(inspector: Any, table: str, column: str) -> list[str]:
+    """Drop ``column``'s single-column indexes, then the column itself.
+
+    SQLite refuses ``DROP COLUMN`` on an indexed column.
+    """
+    indexes = [
+        index["name"]
+        for index in inspector.get_indexes(table)
+        if index["column_names"] == [column] and index["name"]
+    ]
+    return [
+        *(f"DROP INDEX {name}" for name in indexes),
+        f"ALTER TABLE {table} DROP COLUMN {column}",
+    ]
+
+
+def _is_destructive(sql: str) -> bool:
+    upper = sql.upper()
+    return upper.lstrip().startswith("DROP ") or " DROP COLUMN " in upper
+
+
 def pending_migrations(engine: Engine) -> list[str]:
-    """Schema changes the database still needs, including the website fold."""
-    return generate_migrations(engine) + vendor_website_statements(engine)
+    """Schema changes the database still needs, including the data folds."""
+    return (
+        rename_statements(engine)
+        + generate_migrations(engine)
+        + vendor_website_statements(engine)
+        + price_target_statements(engine)
+        + quote_status_statements(engine)
+        + quote_currency_statements(engine)
+    )
 
 
 def run_migrations(engine: Engine, dry_run: bool = False) -> list[str]:
@@ -302,6 +503,13 @@ def run_migrations(engine: Engine, dry_run: bool = False) -> list[str]:
 
     with engine.connect() as conn:
         for sql in migrations:
+            # A drop after a failed copy would delete the only copy of the data.
+            if failures and _is_destructive(sql):
+                logger.error(f"Skipped after an earlier failure: {sql[:80]}")
+                failures.append(
+                    (sql, MigrationError("skipped because an earlier statement failed"))
+                )
+                continue
             logger.info(f"Executing: {sql[:80]}...")
             try:
                 conn.execute(text(sql))

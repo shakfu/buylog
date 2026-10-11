@@ -74,15 +74,15 @@ class QuoteHistoryFactory(factory.alchemy.SQLAlchemyModelFactory):
         model = models.QuoteHistory
 
 
-class PriceAlertFactory(factory.alchemy.SQLAlchemyModelFactory):
+class PriceTargetFactory(factory.alchemy.SQLAlchemyModelFactory):
     id = factory.Sequence(lambda n: "%s" % n)
     product = factory.SubFactory(ProductFactory)
-    threshold_value = factory.fuzzy.FuzzyFloat(50.0, 1000.0)
-    threshold_currency = "USD"
+    threshold = factory.fuzzy.FuzzyFloat(50.0, 1000.0)
+    currency = "USD"
     active = 1
 
     class Meta:
-        model = models.PriceAlert
+        model = models.PriceTarget
 
 
 class SpecificationFactory(factory.alchemy.SQLAlchemyModelFactory):

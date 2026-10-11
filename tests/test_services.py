@@ -299,7 +299,6 @@ def test_quote_service_create_with_currency_conversion(dbsession):
     assert quote.original_value == 800.0
     assert quote.original_currency == "GBP"
     assert quote.value == 800.0 * 1.25  # Converted to USD
-    assert quote.currency == "USD"
 
 
 def test_quote_service_get_all_eager_loads(dbsession):
@@ -324,7 +323,7 @@ def test_forex_service_create(dbsession):
 
     assert fx.id is not None
     assert fx.code == "EUR"
-    assert fx.usd_per_unit == 1.085
+    assert fx.base_per_unit == 1.085
     assert fx.date == datetime.date.today()
 
 
@@ -366,7 +365,7 @@ def test_forex_service_create_same_code_different_date(dbsession):
     ForexService.create(dbsession, "EUR", 1.085, date=datetime.date(2025, 10, 15))
     fx = ForexService.create(dbsession, "EUR", 1.090, date=datetime.date(2025, 10, 16))
 
-    assert fx.usd_per_unit == 1.090
+    assert fx.base_per_unit == 1.090
 
 
 def test_forex_service_get_latest(dbsession):
@@ -377,7 +376,7 @@ def test_forex_service_get_latest(dbsession):
 
     latest = ForexService.get_latest(dbsession, "EUR")
 
-    assert latest.usd_per_unit == 1.090
+    assert latest.base_per_unit == 1.090
     assert latest.date == datetime.date(2025, 10, 17)
 
 
@@ -915,21 +914,21 @@ def test_purchase_order_service_get_all_by_status(dbsession):
 # Forex normalization (multi-rate) tests
 def test_forex_get_latest_with_multiple_rates(dbsession):
     """get_latest must pick the newest rate, not error on multiple rows."""
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.1))
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 2, 1), usd_per_unit=1.2))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.1))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 2, 1), base_per_unit=1.2))
     dbsession.commit()
-    assert ForexService.get_latest(dbsession, "EUR").usd_per_unit == 1.2
+    assert ForexService.get_latest(dbsession, "EUR").base_per_unit == 1.2
 
 
 def test_forex_to_usd_passes_through_usd(dbsession):
-    assert ForexService.to_usd(dbsession, 100.0, "USD") == (100.0, None, None)
+    assert ForexService.to_base(dbsession, 100.0, "USD") == (100.0, None, None)
 
 
 def test_forex_to_usd_uses_latest_rate(dbsession):
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.1))
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 2, 1), usd_per_unit=1.2))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.1))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 2, 1), base_per_unit=1.2))
     dbsession.commit()
-    value, original_value, original_currency = ForexService.to_usd(
+    value, original_value, original_currency = ForexService.to_base(
         dbsession, 100.0, "EUR"
     )
     assert value == pytest.approx(120.0)
@@ -939,13 +938,13 @@ def test_forex_to_usd_uses_latest_rate(dbsession):
 
 def test_forex_to_usd_raises_without_rate(dbsession):
     with pytest.raises(ValidationError, match="Forex rate for 'JPY' not found"):
-        ForexService.to_usd(dbsession, 100.0, "JPY")
+        ForexService.to_base(dbsession, 100.0, "JPY")
 
 
 def test_quote_create_with_multiple_forex_rates(dbsession):
     """Regression: a second rate for a currency broke foreign-currency quotes."""
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.1))
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 2, 1), usd_per_unit=1.2))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.1))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 2, 1), base_per_unit=1.2))
     dbsession.commit()
     VendorService.create(dbsession, "EuroShop", currency="EUR")
     quote = QuoteService.create(
@@ -964,9 +963,9 @@ def test_forex_duplicate_code_and_date_rejected_by_database(dbsession):
     """The (code, date) unique constraint is enforced at the database level."""
     from sqlalchemy.exc import IntegrityError
 
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.1))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.1))
     dbsession.commit()
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.2))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.2))
     with pytest.raises(IntegrityError):
         dbsession.commit()
     dbsession.rollback()
@@ -999,19 +998,18 @@ def test_delete_quote_removes_its_history(dbsession):
     assert orphans == []
 
 
-def test_delete_product_removes_alerts_and_watchlist(dbsession):
-    from buylog.models import PriceAlert, Watchlist
-    from buylog.services import PriceAlertService, WatchlistService
+def test_delete_product_removes_price_targets(dbsession):
+    from buylog.models import PriceTarget
+    from buylog.services import PriceTargetService
     from sqlalchemy import select
 
     ProductService.create(dbsession, "iPhone 15", "Apple")
-    PriceAlertService.create(dbsession, "iPhone 15", 900.0)
-    WatchlistService.create(dbsession, "iPhone 15", 800.0)
+    PriceTargetService.create(dbsession, "iPhone 15", 900.0)
+    PriceTargetService.create(dbsession, "iPhone 15", 800.0, "EUR")
 
     ProductService.delete(dbsession, "iPhone 15")
 
-    assert dbsession.execute(select(PriceAlert)).scalars().all() == []
-    assert dbsession.execute(select(Watchlist)).scalars().all() == []
+    assert dbsession.execute(select(PriceTarget)).scalars().all() == []
 
 
 def test_delete_vendor_removes_its_quotes(dbsession):
@@ -1064,7 +1062,7 @@ def test_vendor_service_delete_missing_raises(dbsession):
 
 
 def test_quote_service_update_converts_price(dbsession):
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.2))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.2))
     dbsession.commit()
     VendorService.create(dbsession, "EuroShop", currency="EUR")
     quote = QuoteService.create(dbsession, "EuroShop", "TV", 100.0, brand_name="Sony")
@@ -1076,13 +1074,14 @@ def test_quote_service_update_converts_price(dbsession):
     assert updated.original_currency == "EUR"
 
 
-def test_quote_service_update_rejects_bad_status(dbsession):
+def test_quote_service_update_cannot_set_status(dbsession):
+    """Status is derived; writing it here skipped the order and the list."""
     VendorService.create(dbsession, "Amazon")
     quote = QuoteService.create(
         dbsession, "Amazon", "iPhone 15", 999.0, brand_name="Apple"
     )
-    with pytest.raises(ValidationError, match="Invalid status"):
-        QuoteService.update(dbsession, quote.id, status="nonsense")
+    with pytest.raises(TypeError):
+        QuoteService.update(dbsession, quote.id, status="ordered")
 
 
 def test_quote_service_delete_missing_raises(dbsession):
@@ -1127,7 +1126,7 @@ def test_import_row_without_forex_rate_is_rejected(dbsession, tmp_path):
 def test_import_row_converts_with_forex_rate(dbsession, tmp_path):
     from buylog.services import ImportService
 
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.2))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.2))
     dbsession.commit()
     VendorService.create(dbsession, "EuroShop", currency="EUR")
     ProductService.create(dbsession, "TV", "Sony")
@@ -1163,45 +1162,41 @@ def test_failed_import_row_leaves_no_orphans(dbsession, tmp_path):
     assert VendorService.get_all(dbsession, filter_by="OrphanShop") == []
 
 
-def test_alert_threshold_in_foreign_currency_is_converted(dbsession):
+def test_target_threshold_in_foreign_currency_is_converted(dbsession):
     """A non-USD threshold used to be compared as if it were USD."""
-    from buylog.models import PriceAlert
-    from buylog.services import PriceAlertService
+    from buylog.models import PriceTarget
+    from buylog.services import PriceTargetService
 
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.2))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.2))
     dbsession.commit()
     product = ProductService.create(dbsession, "TV", "Sony")
 
     # 100 EUR == 120 USD
-    alert = PriceAlert(
-        product_id=product.id, threshold_value=100.0, threshold_currency="EUR"
-    )
+    alert = PriceTarget(product_id=product.id, threshold=100.0, currency="EUR")
     dbsession.add(alert)
     dbsession.commit()
 
     # 110 USD is below the 120 USD threshold, but above the raw value of 100
-    triggered = PriceAlertService.check_alerts(dbsession, product, 110.0)
+    triggered = PriceTargetService.check(dbsession, product, 110.0)
     assert triggered == [alert]
 
 
-def test_alert_without_forex_rate_is_skipped_not_miscompared(dbsession):
-    from buylog.models import PriceAlert
-    from buylog.services import PriceAlertService
+def test_target_without_forex_rate_is_skipped_not_miscompared(dbsession):
+    from buylog.models import PriceTarget
+    from buylog.services import PriceTargetService
 
     product = ProductService.create(dbsession, "TV", "Sony")
-    alert = PriceAlert(
-        product_id=product.id, threshold_value=100.0, threshold_currency="JPY"
-    )
+    alert = PriceTarget(product_id=product.id, threshold=100.0, currency="JPY")
     dbsession.add(alert)
     dbsession.commit()
 
-    assert PriceAlertService.check_alerts(dbsession, product, 50.0) == []
+    assert PriceTargetService.check(dbsession, product, 50.0) == []
 
 
 def test_purchase_order_defaults_to_vendor_currency(dbsession):
     from buylog.services import PurchaseOrderService
 
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.2))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.2))
     dbsession.commit()
     VendorService.create(dbsession, "EuroShop", currency="EUR")
     ProductService.create(dbsession, "TV", "Sony")
@@ -1217,7 +1212,7 @@ def test_purchase_order_defaults_to_vendor_currency(dbsession):
 
     assert po.currency == "EUR"
     assert po.grand_total == pytest.approx(200.0)
-    assert po.grand_total_usd == pytest.approx(240.0)
+    assert po.grand_total_base == pytest.approx(240.0)
 
 
 # Deletes must not destroy or strand purchase orders
@@ -1279,7 +1274,7 @@ def test_commit_or_rollback_discards_work_when_the_body_fails(dbsession):
 
 def test_shipping_cost_is_normalized_to_usd(dbsession):
     """Regression: EUR shipping was added onto a USD base in total_cost."""
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.1))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.1))
     dbsession.commit()
     VendorService.create(dbsession, "EuroShop", currency="EUR")
 
@@ -1293,7 +1288,7 @@ def test_shipping_cost_is_normalized_to_usd(dbsession):
 
 
 def test_quote_update_normalizes_shipping_cost(dbsession):
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.1))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.1))
     dbsession.commit()
     VendorService.create(dbsession, "EuroShop", currency="EUR")
     quote = QuoteService.create(dbsession, "EuroShop", "TV", 100.0, brand_name="Sony")
@@ -1306,7 +1301,7 @@ def test_quote_update_normalizes_shipping_cost(dbsession):
 def test_import_normalizes_shipping_cost(dbsession, tmp_path):
     from buylog.services import ImportService
 
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.1))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.1))
     dbsession.commit()
     VendorService.create(dbsession, "EuroShop", currency="EUR")
     ProductService.create(dbsession, "TV", "Sony")

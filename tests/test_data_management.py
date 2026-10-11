@@ -56,7 +56,6 @@ def quote(dbsession, product, vendor):
     quote = Quote(
         product=product,
         vendor=vendor,
-        currency="USD",
         value=100.0,
     )
     dbsession.add(quote)
@@ -389,8 +388,8 @@ class TestDeduplicationService:
         dbsession.add_all([v1, v2])
         dbsession.flush()
 
-        q1 = Quote(product=product, vendor=v1, value=100.0, currency="USD")
-        q2 = Quote(product=product, vendor=v2, value=110.0, currency="USD")
+        q1 = Quote(product=product, vendor=v1, value=100.0)
+        q2 = Quote(product=product, vendor=v2, value=110.0)
         dbsession.add_all([q1, q2])
         dbsession.commit()
 
@@ -411,8 +410,8 @@ class TestDeduplicationService:
         dbsession.add_all([p1, p2])
         dbsession.flush()
 
-        q1 = Quote(product=p1, vendor=vendor, value=100.0, currency="USD")
-        q2 = Quote(product=p2, vendor=vendor, value=110.0, currency="USD")
+        q1 = Quote(product=p1, vendor=vendor, value=100.0)
+        q2 = Quote(product=p2, vendor=vendor, value=110.0)
         dbsession.add_all([q1, q2])
         dbsession.commit()
 

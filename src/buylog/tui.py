@@ -3,6 +3,7 @@
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
@@ -30,20 +31,20 @@ from .models import (
     Vendor,
     Quote,
     Forex,
-    PriceAlert,
+    PriceTarget,
     PurchaseList,
-    Watchlist,
+    format_money,
+    get_base_currency,
 )
 from .services import (
     BrandService,
     ProductService,
     VendorService,
     QuoteService,
-    PriceAlertService,
+    PriceTargetService,
     QuoteHistoryService,
     ComparisonService,
     PurchaseListService,
-    WatchlistService,
     SpecificationService,
     PurchaseOrderService,
     ForexService,
@@ -247,7 +248,9 @@ class AddForexScreen(Screen[tuple[str, float, str | None] | None]):
                 yield Input(placeholder="Currency code (e.g., EUR)", id="code")
             with Horizontal(classes="form-row"):
                 yield Label("Rate *", classes="form-label")
-                yield Input(placeholder="USD per unit (e.g., 1.085)", id="rate")
+                yield Input(
+                    placeholder="Base currency per unit (e.g., 1.085)", id="rate"
+                )
             with Horizontal(classes="form-row"):
                 yield Label("Date", classes="form-label")
                 yield Input(placeholder="YYYY-MM-DD (optional)", id="date")
@@ -277,54 +280,6 @@ class AddForexScreen(Screen[tuple[str, float, str | None] | None]):
             self.dismiss((code, rate, date_str))
         except ValueError:
             self.notify("Invalid rate", severity="error")
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-
-class AddAlertScreen(Screen[tuple[str, float] | None]):
-    """Full-screen form for adding a price alert."""
-
-    BINDINGS = [
-        Binding("escape", "cancel", "Cancel", show=True),
-        Binding("ctrl+s", "save", "Save", show=True),
-    ]
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        with Vertical(id="fullscreen-form"):
-            yield Label("[bold]Add Price Alert[/bold]", id="form-title")
-            with Horizontal(classes="form-row"):
-                yield Label("Product *", classes="form-label")
-                yield Input(placeholder="Product name", id="product-name")
-            with Horizontal(classes="form-row"):
-                yield Label("Threshold *", classes="form-label")
-                yield Input(placeholder="Price threshold", id="threshold")
-            with Horizontal(id="form-buttons"):
-                yield Button("Save (Ctrl+S)", variant="primary", id="save-btn")
-                yield Button("Cancel (Esc)", variant="default", id="cancel-btn")
-        yield Footer()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "save-btn":
-            self._do_save()
-        else:
-            self.dismiss(None)
-
-    def action_save(self) -> None:
-        self._do_save()
-
-    def _do_save(self) -> None:
-        product = self.query_one("#product-name", Input).value
-        threshold_str = self.query_one("#threshold", Input).value
-        if not product:
-            self.notify("Product name is required", severity="error")
-            return
-        try:
-            threshold = float(threshold_str) if threshold_str else 0.0
-            self.dismiss((product, threshold))
-        except ValueError:
-            self.notify("Invalid threshold value", severity="error")
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -374,32 +329,40 @@ class AddPurchaseListScreen(Screen[tuple[str, str | None] | None]):
         self.dismiss(None)
 
 
-class AddWatchlistScreen(
-    Screen[tuple[str, float | None, str | None, str | None] | None]
-):
-    """Full-screen form for adding a product to watchlist."""
+class AddTargetScreen(Screen[tuple[str, float | None, str | None] | None]):
+    """
+    Full-screen form for adding a price target.
+
+    With no threshold, the product's quotes go on the Considering list.
+    """
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel", show=True),
         Binding("ctrl+s", "save", "Save", show=True),
     ]
 
+    def __init__(self, product: str = "") -> None:
+        super().__init__()
+        self._product = product
+
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="fullscreen-form"):
-            yield Label("[bold]Add to Watchlist[/bold]", id="form-title")
+            yield Label("[bold]Watch a Product[/bold]", id="form-title")
             with Horizontal(classes="form-row"):
                 yield Label("Product *", classes="form-label")
-                yield Input(placeholder="Product name", id="product-name")
+                yield Input(
+                    value=self._product, placeholder="Product name", id="product-name"
+                )
             with Horizontal(classes="form-row"):
                 yield Label("Target Price", classes="form-label")
-                yield Input(placeholder="Optional target price", id="target-price")
+                yield Input(
+                    placeholder="Empty: put its quotes on Considering",
+                    id="target-price",
+                )
             with Horizontal(classes="form-row"):
                 yield Label("Currency", classes="form-label")
-                yield Input(placeholder="USD", id="currency")
-            with Horizontal(classes="form-row"):
-                yield Label("Notes", classes="form-label")
-                yield Input(placeholder="Optional notes", id="notes")
+                yield Input(placeholder="Base currency", id="currency")
             with Horizontal(id="form-buttons"):
                 yield Button("Save (Ctrl+S)", variant="primary", id="save-btn")
                 yield Button("Cancel (Esc)", variant="default", id="cancel-btn")
@@ -417,14 +380,13 @@ class AddWatchlistScreen(
     def _do_save(self) -> None:
         product = self.query_one("#product-name", Input).value
         target_str = self.query_one("#target-price", Input).value
-        notes = self.query_one("#notes", Input).value or None
         currency = self.query_one("#currency", Input).value.strip() or None
         if not product:
             self.notify("Product name is required", severity="error")
             return
         try:
             target = float(target_str) if target_str else None
-            self.dismiss((product, target, notes, currency))
+            self.dismiss((product, target, currency))
         except ValueError:
             self.notify("Invalid target price", severity="error")
 
@@ -739,6 +701,9 @@ class CompareModal(ModalScreen[None]):
         except NotFoundError as e:
             results_widget.update(f"[red]Error: {e}[/red]")
 
+    def _money(self, amount: float) -> str:
+        return format_money(amount, get_base_currency(self.db_session))
+
     def _format_single_comparison(self, comparison: dict) -> str:
         product = comparison["product"]
         quotes = comparison["quotes"]
@@ -753,16 +718,18 @@ class CompareModal(ModalScreen[None]):
             return "\n".join(lines)
 
         for q in quotes:
-            price_str = f"${q.value:.2f}"
+            price_str = f"{self._money(q.value)}"
             if q == quotes[0]:  # Best price
                 price_str = f"[bold green]{price_str}[/bold green]"
-            lines.append(f"  {q.vendor.name}: {price_str} (total: ${q.total_cost:.2f})")
+            lines.append(
+                f"  {q.vendor.name}: {price_str} (total: {self._money(q.total_cost)})"
+            )
 
         lines.append("")
-        lines.append(f"[green]Best:  ${comparison['best_price']:.2f}[/green]")
-        lines.append(f"[red]Worst: ${comparison['worst_price']:.2f}[/red]")
-        lines.append(f"Avg:   ${comparison['avg_price']:.2f}")
-        lines.append(f"[yellow]Savings: ${comparison['savings']:.2f}[/yellow]")
+        lines.append(f"[green]Best:  {self._money(comparison['best_price'])}[/green]")
+        lines.append(f"[red]Worst: {self._money(comparison['worst_price'])}[/red]")
+        lines.append(f"Avg:   {self._money(comparison['avg_price'])}")
+        lines.append(f"[yellow]Savings: {self._money(comparison['savings'])}[/yellow]")
 
         return "\n".join(lines)
 
@@ -774,8 +741,8 @@ class CompareModal(ModalScreen[None]):
             if comp["best_price"]:
                 lines.append(
                     f"[bold]{product.name}[/bold]: "
-                    f"[green]${comp['best_price']:.2f}[/green] - "
-                    f"[red]${comp['worst_price']:.2f}[/red] "
+                    f"[green]{self._money(comp['best_price'])}[/green] - "
+                    f"[red]{self._money(comp['worst_price'])}[/red] "
                     f"({comp['num_vendors']} vendors)"
                 )
             else:
@@ -812,7 +779,7 @@ class AddVendorScreen(Screen[dict | None]):
                     yield Input(placeholder="Vendor name", id="vendor-name")
                 with Horizontal(classes="form-row"):
                     yield Label("Currency", classes="form-label")
-                    yield Input(placeholder="USD", id="currency")
+                    yield Input(placeholder="Base currency", id="currency")
                 with Horizontal(classes="form-row"):
                     yield Label("Discount Code", classes="form-label")
                     yield Input(placeholder="Optional", id="discount-code")
@@ -876,7 +843,7 @@ class AddVendorScreen(Screen[dict | None]):
     def _do_save(self) -> None:
         result = {
             "name": self.query_one("#vendor-name", Input).value,
-            "currency": self.query_one("#currency", Input).value or "USD",
+            "currency": self.query_one("#currency", Input).value or None,
             "discount_code": self.query_one("#discount-code", Input).value or None,
             "discount": float(self.query_one("#discount", Input).value or 0),
             "url": self.query_one("#url", Input).value or None,
@@ -1102,7 +1069,7 @@ class AddPurchaseOrderScreen(Screen[dict | None]):
                     yield Input(placeholder="1", value="1", id="quantity")
                 with Horizontal(classes="form-row"):
                     yield Label("Currency", classes="form-label")
-                    yield Input(placeholder="USD", value="USD", id="currency")
+                    yield Input(placeholder="Vendor's currency", id="currency")
 
                 yield Label("[bold]Costs[/bold]", classes="section-header")
                 with Horizontal(classes="form-row"):
@@ -1145,7 +1112,7 @@ class AddPurchaseOrderScreen(Screen[dict | None]):
                 "product": self.query_one("#product-name", Input).value,
                 "unit_price": float(self.query_one("#unit-price", Input).value or 0),
                 "quantity": int(self.query_one("#quantity", Input).value or 1),
-                "currency": self.query_one("#currency", Input).value or "USD",
+                "currency": self.query_one("#currency", Input).value or None,
                 "shipping_cost": float(
                     self.query_one("#shipping-cost", Input).value or 0
                 )
@@ -1352,20 +1319,20 @@ class BuyerApp(App):
         Binding("a", "add", "Add"),
         Binding("d", "delete", "Delete"),
         Binding("r", "refresh", "Refresh"),
-        Binding("s", "search", "Search"),
         Binding("/", "focus_search", "Search"),
         Binding("c", "compare", "Compare"),
         Binding("t", "set_status", "Status"),
-        Binding("w", "add_to_watchlist", "Watch"),
+        Binding("w", "watch", "Watch"),
         # Tab switching with Ctrl+number
         Binding("ctrl+1", "switch_tab('brands-tab')", "Brands", show=False),
         Binding("ctrl+2", "switch_tab('products-tab')", "Products", show=False),
         Binding("ctrl+3", "switch_tab('vendors-tab')", "Vendors", show=False),
         Binding("ctrl+4", "switch_tab('quotes-tab')", "Quotes", show=False),
         Binding("ctrl+5", "switch_tab('forex-tab')", "Forex", show=False),
-        Binding("ctrl+6", "switch_tab('alerts-tab')", "Alerts", show=False),
+        Binding("ctrl+6", "switch_tab('targets-tab')", "Targets", show=False),
         Binding("ctrl+7", "switch_tab('lists-tab')", "Lists", show=False),
-        Binding("ctrl+8", "switch_tab('watchlist-tab')", "Watchlist", show=False),
+        Binding("ctrl+8", "switch_tab('specs-tab')", "Specs", show=False),
+        Binding("ctrl+9", "switch_tab('pos-tab')", "POs", show=False),
         # Vim-style navigation
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
@@ -1394,10 +1361,23 @@ class BuyerApp(App):
         "vendors-tab",
         "quotes-tab",
         "forex-tab",
-        "alerts-tab",
+        "targets-tab",
         "lists-tab",
-        "watchlist-tab",
+        "specs-tab",
+        "pos-tab",
     ]
+
+    # Tabs a tab-specific action works on. Actions not listed work on every
+    # tab. check_action hides the others' keys from the footer.
+    ACTION_TABS = {
+        "delete": set(TAB_ORDER) - {"specs-tab", "pos-tab"},
+        "edit": {"brands-tab", "products-tab", "vendors-tab", "quotes-tab"},
+        "filter_quotes": {"quotes-tab"},
+        "set_status": {"quotes-tab"},
+        "watch": {"products-tab"},
+        "copy_to_clipboard": {"quotes-tab", "products-tab", "vendors-tab"},
+        "open_url": {"vendors-tab"},
+    }
 
     def __init__(self) -> None:
         super().__init__()
@@ -1428,12 +1408,10 @@ class BuyerApp(App):
                 yield DataTable(id="quotes-table")
             with TabPane("Forex", id="forex-tab"):
                 yield DataTable(id="forex-table")
-            with TabPane("Alerts", id="alerts-tab"):
-                yield DataTable(id="alerts-table")
+            with TabPane("Targets", id="targets-tab"):
+                yield DataTable(id="targets-table")
             with TabPane("Lists", id="lists-tab"):
                 yield DataTable(id="lists-table")
-            with TabPane("Watchlist", id="watchlist-tab"):
-                yield DataTable(id="watchlist-table")
             with TabPane("Specs", id="specs-tab"):
                 yield DataTable(id="specs-table")
             with TabPane("POs", id="pos-tab"):
@@ -1474,22 +1452,18 @@ class BuyerApp(App):
         quotes_table.cursor_type = "row"
 
         forex_table = self.query_one("#forex-table", DataTable)
-        forex_table.add_columns("ID", "Code", "USD/Unit", "Date")
+        forex_table.add_columns(
+            "ID", "Code", f"{get_base_currency(self.session)}/Unit", "Date"
+        )
         forex_table.cursor_type = "row"
 
-        alerts_table = self.query_one("#alerts-table", DataTable)
-        alerts_table.add_columns("ID", "Product", "Threshold", "Status", "Triggered At")
-        alerts_table.cursor_type = "row"
+        targets_table = self.query_one("#targets-table", DataTable)
+        targets_table.add_columns("ID", "Product", "Target", "Status", "Triggered At")
+        targets_table.cursor_type = "row"
 
         lists_table = self.query_one("#lists-table", DataTable)
         lists_table.add_columns("ID", "Name", "Description", "Quotes", "Total")
         lists_table.cursor_type = "row"
-
-        watchlist_table = self.query_one("#watchlist-table", DataTable)
-        watchlist_table.add_columns(
-            "ID", "Product", "Brand", "Target Price", "Notes", "Status"
-        )
-        watchlist_table.cursor_type = "row"
 
         specs_table = self.query_one("#specs-table", DataTable)
         specs_table.add_columns("ID", "Name", "Description", "Features", "Products")
@@ -1508,9 +1482,8 @@ class BuyerApp(App):
         self._refresh_vendors(filter_by)
         self._refresh_quotes(filter_by)
         self._refresh_forex(filter_by)
-        self._refresh_alerts(filter_by)
+        self._refresh_targets(filter_by)
         self._refresh_lists(filter_by)
-        self._refresh_watchlist(filter_by)
         self._refresh_specs(filter_by)
         self._refresh_pos(filter_by)
 
@@ -1577,9 +1550,10 @@ class BuyerApp(App):
         product_ids = list(set(q.product_id for q in results))
         best_prices = QuoteService.get_best_prices_by_product(self.session, product_ids)
 
-        # Get triggered alerts for yellow highlighting
-        triggered_alerts = PriceAlertService.get_triggered(self.session)
-        alerted_product_ids = {a.product_id for a in triggered_alerts}
+        # Products whose price target the best price meets, for yellow
+        alerted_product_ids = {
+            t.product_id for t in PriceTargetService.met_now(self.session)
+        }
 
         # Build rows with data for sorting
         rows: list[dict[str, object]] = []
@@ -1691,35 +1665,36 @@ class BuyerApp(App):
             query = query.where(Forex.code.ilike(f"%{filter_by}%"))
         results = self.session.execute(query).scalars().all()
         for f in results:
-            table.add_row(f.id, f.code, f.usd_per_unit, str(f.date), key=str(f.id))
+            table.add_row(f.id, f.code, f.base_per_unit, str(f.date), key=str(f.id))
 
-    def _refresh_alerts(self, filter_by: str | None = None) -> None:
+    def _refresh_targets(self, filter_by: str | None = None) -> None:
         from rich.text import Text
 
-        table = self.query_one("#alerts-table", DataTable)
+        table = self.query_one("#targets-table", DataTable)
         table.clear()
-        alerts = PriceAlertService.get_all(self.session)
 
-        for a in alerts:
-            if filter_by and filter_by.lower() not in a.product.name.lower():
+        met_ids = {t.id for t in PriceTargetService.met_now(self.session)}
+        for t in PriceTargetService.get_all(self.session):
+            if filter_by and filter_by.lower() not in t.product.name.lower():
                 continue
 
-            if a.triggered_at:
+            if t.triggered_at:
                 status_text = Text("Triggered", style="bold yellow")
-            elif a.active:
+            elif t.id in met_ids:
+                # Met, but `buylog check` has not notified it yet.
+                status_text = Text("Met", style="yellow")
+            elif t.active:
                 status_text = Text("Active", style="green")
             else:
                 status_text = Text("Inactive", style="dim")
 
-            triggered_at = str(a.triggered_at) if a.triggered_at else "-"
-
             table.add_row(
-                a.id,
-                a.product.name,
-                f"${a.threshold_value:.2f}",
+                t.id,
+                t.product.name,
+                t.label,
                 status_text,
-                triggered_at,
-                key=str(a.id),
+                str(t.triggered_at) if t.triggered_at else "-",
+                key=str(t.id),
             )
 
     def _refresh_lists(self, filter_by: str | None = None) -> None:
@@ -1740,39 +1715,8 @@ class BuyerApp(App):
                 plist.name,
                 desc,
                 len(plist.quotes),
-                f"${plist.total_value:.2f}",
+                f"{self._money(plist.total_value)}",
                 key=str(plist.id),
-            )
-
-    def _refresh_watchlist(self, filter_by: str | None = None) -> None:
-        from rich.text import Text
-
-        table = self.query_one("#watchlist-table", DataTable)
-        table.clear()
-        items = WatchlistService.get_all(self.session)
-
-        for w in items:
-            if filter_by and filter_by.lower() not in w.product.name.lower():
-                continue
-
-            target = w.target_label
-            notes = w.notes or "-"
-            if len(notes) > 25:
-                notes = notes[:22] + "..."
-
-            if w.active:
-                status_text = Text("Active", style="green")
-            else:
-                status_text = Text("Inactive", style="dim")
-
-            table.add_row(
-                w.id,
-                w.product.name,
-                w.product.brand.name,
-                target,
-                notes,
-                status_text,
-                key=str(w.id),
             )
 
     def _refresh_specs(self, filter_by: str | None = None) -> None:
@@ -1827,16 +1771,35 @@ class BuyerApp(App):
                 po.vendor.name,
                 po.product.name,
                 po.quantity,
-                f"${po.grand_total:.2f}",
+                f"{po.grand_total:.2f} {po.currency}",
                 status_text,
                 order_date,
                 key=str(po.id),
             )
 
+    def _money(self, amount: float) -> str:
+        """An amount in the database's base currency, formatted for display."""
+        return format_money(amount, get_base_currency(self.session))
+
     def _get_active_tab(self) -> str:
         """Get the currently active tab ID."""
         tabbed = self.query_one(TabbedContent)
         return tabbed.active or "brands-tab"
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
+        """Enable a tab-specific action only on the tabs it works on."""
+        tabs = self.ACTION_TABS.get(action)
+        if tabs is None:
+            return True
+        try:
+            return self._get_active_tab() in tabs
+        except NoMatches:  # before compose
+            return True
+
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        self.refresh_bindings()
 
     def action_add(self) -> None:
         """Add a new entity based on current tab."""
@@ -1851,12 +1814,10 @@ class BuyerApp(App):
             self.push_screen(AddQuoteScreen(), self._on_quote_added)
         elif active == "forex-tab":
             self.push_screen(AddForexScreen(), self._on_forex_added)
-        elif active == "alerts-tab":
-            self.push_screen(AddAlertScreen(), self._on_alert_added)
+        elif active == "targets-tab":
+            self.push_screen(AddTargetScreen(), self._on_target_added)
         elif active == "lists-tab":
             self.push_screen(AddPurchaseListScreen(), self._on_list_added)
-        elif active == "watchlist-tab":
-            self.push_screen(AddWatchlistScreen(), self._on_watchlist_added)
         elif active == "specs-tab":
             self.push_screen(AddSpecificationScreen(), self._on_specification_added)
         elif active == "pos-tab":
@@ -1941,7 +1902,9 @@ class BuyerApp(App):
                     invoice_number=result.get("invoice_number"),
                     notes=result.get("notes"),
                 )
-                self.notify(f"Created PO: {po.po_number} (${po.grand_total:.2f})")
+                self.notify(
+                    f"Created PO: {po.po_number} ({po.grand_total:.2f} {po.currency})"
+                )
                 self._refresh_pos()
             except DuplicateError:
                 self.notify(
@@ -2033,21 +1996,6 @@ class BuyerApp(App):
                 self.session.rollback()
                 self.notify(str(e), severity="error")
 
-    def _on_alert_added(self, result: tuple[str, float] | None) -> None:
-        if result:
-            product_name, threshold = result
-            try:
-                PriceAlertService.create(self.session, product_name, threshold)
-                self.notify(f"Added alert for '{product_name}' at ${threshold:.2f}")
-                self._refresh_alerts()
-            except NotFoundError as e:
-                self.notify(str(e), severity="error")
-            except ValidationError as e:
-                self.notify(str(e), severity="error")
-            except Exception as e:
-                self.session.rollback()
-                self.notify(str(e), severity="error")
-
     def _on_list_added(self, result: tuple[str, str | None] | None) -> None:
         if result:
             name, description = result
@@ -2063,34 +2011,34 @@ class BuyerApp(App):
                 self.session.rollback()
                 self.notify(str(e), severity="error")
 
-    def _on_watchlist_added(
-        self, result: tuple[str, float | None, str | None, str | None] | None
+    def _on_target_added(
+        self, result: tuple[str, float | None, str | None] | None
     ) -> None:
-        if result:
-            product_name, target_price, notes, currency = result
-            try:
-                if target_price is None:
-                    quotes = PurchaseListService.consider_product(
-                        self.session, product_name
-                    )
-                    self.notify(
-                        f"Added {len(quotes)} quote(s) for '{product_name}' "
-                        "to Considering"
-                    )
-                    self._refresh_lists()
-                else:
-                    WatchlistService.create(
-                        self.session, product_name, target_price, notes, currency
-                    )
-                    self.notify(f"Added '{product_name}' to watchlist")
-                    self._refresh_watchlist()
-            except NotFoundError as e:
-                self.notify(str(e), severity="error")
-            except DuplicateError as e:
-                self.notify(str(e), severity="warning")
-            except Exception as e:
-                self.session.rollback()
-                self.notify(str(e), severity="error")
+        if not result:
+            return
+        product_name, threshold, currency = result
+        try:
+            if threshold is None:
+                quotes = PurchaseListService.consider_product(
+                    self.session, product_name
+                )
+                self.notify(
+                    f"Added {len(quotes)} quote(s) for '{product_name}' to Considering"
+                )
+                self._refresh_lists()
+            else:
+                target = PriceTargetService.create(
+                    self.session, product_name, threshold, currency
+                )
+                self.notify(f"Watching '{product_name}' for {target.label}")
+                self._refresh_targets()
+        except DuplicateError as e:
+            self.notify(str(e), severity="warning")
+        except (NotFoundError, ValidationError) as e:
+            self.notify(str(e), severity="error")
+        except Exception as e:
+            self.session.rollback()
+            self.notify(str(e), severity="error")
 
     def action_delete(self) -> None:
         """Delete the selected entity."""
@@ -2132,16 +2080,14 @@ class BuyerApp(App):
                 entity = self.session.get(Quote, entity_id)
             elif entity_type == "forex":
                 entity = self.session.get(Forex, entity_id)
-            elif entity_type == "alert":
-                entity = self.session.get(PriceAlert, entity_id)
+            elif entity_type == "target":
+                entity = self.session.get(PriceTarget, entity_id)
             elif entity_type == "list":
                 entity = self.session.get(PurchaseList, entity_id)
-            elif entity_type == "watchlist":
-                entity = self.session.get(Watchlist, entity_id)
 
             if entity:
                 # Named entities go through their service so dependent rows
-                # (price history, alerts, watchlist entries) go with them.
+                # (price history, price targets) go with them.
                 deleters = {
                     "brand": BrandService.delete,
                     "product": ProductService.delete,
@@ -2352,7 +2298,7 @@ class BuyerApp(App):
             try:
                 new_price = float(new_value)
                 QuoteService.update_price(self.session, entity_id, new_price)
-                self.notify(f"Updated quote price to: ${new_price:.2f}")
+                self.notify(f"Updated quote price to: {self._money(new_price)}")
                 self._refresh_quotes()
             except ValueError:
                 self.notify("Invalid price value", severity="error")
@@ -2420,24 +2366,14 @@ class BuyerApp(App):
                 self.session.rollback()
                 self.notify(str(e), severity="error")
 
-    def action_add_to_watchlist(self) -> None:
-        """Add selected product to watchlist."""
-        active = self._get_active_tab()
-        if active == "products-tab":
-            table = self.query_one("#products-table", DataTable)
-            if table.cursor_row is None or table.row_count == 0:
-                self.notify("No product selected", severity="warning")
-                return
-
-            try:
-                self.push_screen(
-                    AddWatchlistScreen(),
-                    self._on_watchlist_added,
-                )
-            except RowDoesNotExist:
-                self.notify("No product selected", severity="warning")
-        else:
-            self.push_screen(AddWatchlistScreen(), self._on_watchlist_added)
+    def action_watch(self) -> None:
+        """Add a price target for the selected product."""
+        table = self.query_one("#products-table", DataTable)
+        try:
+            name = str(table.get_row_at(table.cursor_row)[1])
+        except RowDoesNotExist:
+            name = ""
+        self.push_screen(AddTargetScreen(name), self._on_target_added)
 
     def action_compare(self) -> None:
         """Open price comparison modal."""
@@ -2555,12 +2491,10 @@ class BuyerApp(App):
             self._refresh_vendors()
         elif active == "forex-tab":
             self._refresh_forex()
-        elif active == "alerts-tab":
-            self._refresh_alerts()
+        elif active == "targets-tab":
+            self._refresh_targets()
         elif active == "lists-tab":
             self._refresh_lists()
-        elif active == "watchlist-tab":
-            self._refresh_watchlist()
 
     def on_unmount(self) -> None:
         if self.session:

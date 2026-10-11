@@ -2,9 +2,9 @@
 """
 Notification delivery for buylog.
 
-Price alerts and watchlist targets are only useful if they reach the user
-without opening the app. This module turns a triggered alert into a message on
-one or more configured channels.
+Price targets are only useful if they reach the user without opening the
+app. This module turns a met target into a message on one or more
+configured channels.
 
 Channels are chosen with the ``BUYLOG_NOTIFY`` environment variable, as a
 comma-separated list. Everything is configured by environment variable so a

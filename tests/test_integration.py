@@ -66,7 +66,6 @@ def quote(dbsession, product, vendor):
     quote = Quote(
         product=product,
         vendor=vendor,
-        currency="USD",
         value=100.0,
     )
     dbsession.add(quote)
@@ -452,7 +451,6 @@ class TestModelFields:
         quote = Quote(
             product=product,
             vendor=vendor,
-            currency="USD",
             value=100.0,
             receipt_path="/path/to/receipt.pdf",
         )
@@ -467,7 +465,6 @@ class TestModelFields:
         quote = Quote(
             product=product,
             vendor=vendor,
-            currency="USD",
             value=100.0,
         )
         dbsession.add(quote)

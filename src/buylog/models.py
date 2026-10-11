@@ -6,7 +6,10 @@ from typing import List
 
 from sqlalchemy import (
     Column,
+    insert,
     Date,
+    case,
+    exists,
     DateTime,
     Float,
     ForeignKey,
@@ -18,7 +21,8 @@ from sqlalchemy import (
 )
 from sqlalchemy import select
 from sqlalchemy.ext.declarative import declared_attr
-from sqlalchemy.orm import relationship, sessionmaker, mapped_column
+from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.orm import object_session, relationship, sessionmaker, mapped_column
 from sqlalchemy.orm import DeclarativeBase, Mapped
 from sqlalchemy.sql import func
 
@@ -47,8 +51,49 @@ class Object:
         return f"<{self.__class__.__name__}(name='{self.name}')>"
 
 
+DEFAULT_BASE_CURRENCY = "USD"
+BASE_CURRENCY_KEY = "base_currency"
+
+
+class Setting(Base):
+    """
+    Facts about the whole database, one row per key.
+
+    ``base_currency`` is the currency every stored amount is normalized to.
+    It is set when the database is created and fixed once amounts exist.
+    """
+
+    __tablename__ = "setting"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str] = mapped_column(String)
+
+
+def get_base_currency(session) -> str:
+    """The database's base currency, cached on the session."""
+    cached = session.info.get(BASE_CURRENCY_KEY)
+    if cached:
+        return cached
+    row = session.get(Setting, BASE_CURRENCY_KEY)
+    code = row.value if row else DEFAULT_BASE_CURRENCY
+    session.info[BASE_CURRENCY_KEY] = code
+    return code
+
+
+def format_money(amount: float, code: str) -> str:
+    """``"$1,234.50"`` for USD, ``"1,234.50 JPY"`` for any other code."""
+    if code.upper() == "USD":
+        return f"${amount:,.2f}"
+    return f"{amount:,.2f} {code.upper()}"
+
+
 class Forex(Base):
-    """Table of forex rates - tracks currency exchange rates over time"""
+    """
+    Exchange rates over time.
+
+    ``base_per_unit`` is how many units of the database's base currency one
+    unit of ``code`` buys.
+    """
 
     __tablename__ = "forex"
     __table_args__ = (
@@ -65,15 +110,17 @@ class Forex(Base):
     code: Mapped[str] = mapped_column(
         String(3), index=True
     )  # ISO 4217 currency codes are 3 chars
-    usd_per_unit: Mapped[float] = mapped_column(Float)
+    base_per_unit: Mapped[float] = mapped_column(Float)
 
     def __repr__(self):
-        return f"<Forex(date={self.date}, {self.code} -> USD: {self.usd_per_unit})>"
+        session = object_session(self)
+        base = get_base_currency(session) if session else DEFAULT_BASE_CURRENCY
+        return f"<Forex(date={self.date}, {self.code} -> {base}: {self.base_per_unit})>"
 
     @property
-    def units_per_usd(self) -> float:
-        """Calculate units per USD from usd_per_unit (for backward compatibility)"""
-        return 1.0 / self.usd_per_unit if self.usd_per_unit != 0 else 0.0
+    def units_per_base(self) -> float:
+        """Units of ``code`` per one unit of the base currency."""
+        return 1.0 / self.base_per_unit if self.base_per_unit != 0 else 0.0
 
 
 VendorBrand = Table(
@@ -136,7 +183,6 @@ class Vendor(Object, Base):
             _quote = Quote(
                 product=_product,
                 vendor=self,
-                currency=self.currency,
                 value=price,
                 discount=discount,
             )
@@ -251,11 +297,8 @@ class Product(Object, Base):
     features: Mapped[List["ProductFeature"]] = relationship(
         "ProductFeature", back_populates="product", cascade="all, delete-orphan"
     )
-    price_alerts: Mapped[List["PriceAlert"]] = relationship(
-        "PriceAlert", back_populates="product", cascade="all, delete-orphan"
-    )
-    watchlist_entries: Mapped[List["Watchlist"]] = relationship(
-        "Watchlist", back_populates="product", cascade="all, delete-orphan"
+    price_targets: Mapped[List["PriceTarget"]] = relationship(
+        "PriceTarget", back_populates="product", cascade="all, delete-orphan"
     )
 
 
@@ -281,7 +324,8 @@ class Quote(Base):
     )
     vendor_id: Mapped[int] = mapped_column(Integer, ForeignKey("vendor.id"))
     vendor: Mapped["Vendor"] = relationship("Vendor", back_populates="quotes")
-    currency: Mapped[str] = mapped_column(String, default="USD")
+    # In the base currency. The amount as entered is original_value /
+    # original_currency, which are null when it was entered in the base.
     value: Mapped[float] = mapped_column(Float)
     original_value: Mapped[float | None] = mapped_column(Float, nullable=True)
     original_currency: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -289,21 +333,71 @@ class Quote(Base):
     shipping_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
     tax_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now())
-    status: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     receipt_path: Mapped[str | None] = mapped_column(String, nullable=True)
     # The product page this quote's price came from, so it can be re-scraped.
     source_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    purchase_orders: Mapped[List["PurchaseOrder"]] = relationship(
+        "PurchaseOrder", back_populates="quote"
+    )
+    purchase_lists: Mapped[List["PurchaseList"]] = relationship(
+        "PurchaseList", secondary="purchase_list_quote", back_populates="quotes"
+    )
+
+    @hybrid_property
+    def status(self) -> str | None:
+        """
+        Derived from the quote's purchase orders and purchase lists.
+
+        ``received`` or ``ordered`` when a purchase order that is not
+        cancelled exists, ``considering`` when the quote is on a purchase
+        list, else None. Nothing stores it, so it cannot disagree with them.
+        Set it with ``QuoteService.set_status``.
+        """
+        active = [
+            po.status for po in self.purchase_orders if po.status != PO_STATUS_CANCELLED
+        ]
+        if active:
+            if PO_STATUS_RECEIVED in active:
+                return QUOTE_STATUS_RECEIVED
+            return QUOTE_STATUS_ORDERED
+        if self.purchase_lists:
+            return QUOTE_STATUS_CONSIDERING
+        return None
+
+    @status.inplace.expression
+    @classmethod
+    def _status_expression(cls):
+        order = PurchaseOrder.__table__
+        received = exists().where(
+            order.c.quote_id == cls.id, order.c.status == PO_STATUS_RECEIVED
+        )
+        ordered = exists().where(
+            order.c.quote_id == cls.id, order.c.status != PO_STATUS_CANCELLED
+        )
+        listed = exists().where(PurchaseListQuote.c.quote_id == cls.id)
+        return case(
+            (received, QUOTE_STATUS_RECEIVED),
+            (ordered, QUOTE_STATUS_ORDERED),
+            (listed, QUOTE_STATUS_CONSIDERING),
+            else_=None,
+        )
+
+    @property
+    def base_currency(self) -> str:
+        """The currency of ``value``: the database's base currency."""
+        session = object_session(self)
+        return get_base_currency(session) if session else DEFAULT_BASE_CURRENCY
 
     @property
     def source_price(self) -> str:
         """
-        The price as the user entered it, e.g. ``"\u20ac999.00"`` or ``"$999.00"``.
+        The price as the user entered it, e.g. ``"999.00 EUR"``.
 
-        Quotes are normalized to USD at entry, but a user who thinks in EUR
-        needs to see what they actually typed.
+        Quotes are normalized to the base currency at entry, but a user who
+        thinks in EUR needs to see what they actually typed.
         """
         if self.original_value is None or not self.original_currency:
-            return f"{self.value:,.2f} USD"
+            return f"{self.value:,.2f} {self.base_currency}"
         return f"{self.original_value:,.2f} {self.original_currency}"
 
     @property
@@ -311,11 +405,12 @@ class Quote(Base):
         """
         The price with its source currency, e.g. ``"999.00 EUR (= $1,085.00)"``.
 
-        Falls back to plain USD when the quote was entered in USD.
+        Just the base amount when the quote was entered in the base currency.
         """
+        normalized = format_money(self.value, self.base_currency)
         if self.original_value is None or not self.original_currency:
-            return f"${self.value:,.2f}"
-        return f"{self.original_value:,.2f} {self.original_currency} (= ${self.value:,.2f})"
+            return normalized
+        return f"{self.original_value:,.2f} {self.original_currency} (= {normalized})"
 
     @property
     def total_cost(self) -> float:
@@ -326,7 +421,7 @@ class Quote(Base):
         return (base + shipping) * tax_multiplier
 
     def __repr__(self):
-        return f"<Quote({self.vendor.name} / {self.product.brand.name} {self.product.name} / {self.value} {self.currency})>"
+        return f"<Quote({self.vendor.name} / {self.product.brand.name} {self.product.name} / {self.value} {self.base_currency})>"
 
 
 class QuoteHistory(Base):
@@ -374,7 +469,9 @@ class PurchaseOrder(Base):
     quote_id: Mapped[int | None] = mapped_column(
         ForeignKey("quote.id"), nullable=True, index=True
     )
-    quote: Mapped["Quote | None"] = relationship("Quote")
+    quote: Mapped["Quote | None"] = relationship(
+        "Quote", back_populates="purchase_orders"
+    )
     vendor_id: Mapped[int] = mapped_column(ForeignKey("vendor.id"), index=True)
     vendor: Mapped["Vendor"] = relationship("Vendor")
     product_id: Mapped[int] = mapped_column(ForeignKey("product.id"), index=True)
@@ -394,9 +491,9 @@ class PurchaseOrder(Base):
     shipping_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
     tax: Mapped[float | None] = mapped_column(Float, nullable=True)
     grand_total: Mapped[float] = mapped_column(Float)  # total + shipping + tax
-    # grand_total normalized to USD, so orders in different vendor currencies
-    # can be compared and summed.
-    grand_total_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # grand_total in the base currency, so orders in different vendor
+    # currencies can be compared and summed.
+    grand_total_base: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     invoice_number: Mapped[str | None] = mapped_column(String, nullable=True)
     notes: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -406,25 +503,36 @@ class PurchaseOrder(Base):
         return f"<PurchaseOrder(po_number='{self.po_number}', status='{self.status}')>"
 
 
-class PriceAlert(Base):
-    """Price alerts for products"""
+class PriceTarget(Base):
+    """
+    A price at or below which the user wants to hear about a product.
 
-    __tablename__ = "price_alert"
+    Replaces ``price_alert`` and ``watchlist``, which stored the same
+    threshold twice. It fires once: ``triggered_at`` is set when it is met,
+    and editing the threshold clears it.
+    """
+
+    __tablename__ = "price_target"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("product.id"), index=True)
-    product: Mapped["Product"] = relationship("Product", back_populates="price_alerts")
-    threshold_value: Mapped[float] = mapped_column(Float)
-    threshold_currency: Mapped[str] = mapped_column(String, default="USD")
+    product: Mapped["Product"] = relationship("Product", back_populates="price_targets")
+    threshold: Mapped[float] = mapped_column(Float)
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
     active: Mapped[int] = mapped_column(Integer, default=1)  # SQLite bool
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now())
     triggered_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime, nullable=True
     )
 
+    @property
+    def label(self) -> str:
+        """Threshold as the user set it, e.g. ``"$800.00"`` or ``"800.00 EUR"``."""
+        return format_money(self.threshold, self.currency)
+
     def __repr__(self):
         status = "active" if self.active else "inactive"
-        return f"<PriceAlert(product_id={self.product_id}, threshold={self.threshold_value}, {status})>"
+        return f"<PriceTarget(product_id={self.product_id}, threshold={self.label}, {status})>"
 
 
 # Junction table for PurchaseList to Quote many-to-many
@@ -446,7 +554,7 @@ class PurchaseList(Base):
     description: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now())
     quotes: Mapped[List["Quote"]] = relationship(
-        "Quote", secondary=PurchaseListQuote, backref="purchase_lists"
+        "Quote", secondary=PurchaseListQuote, back_populates="purchase_lists"
     )
 
     @classmethod
@@ -519,38 +627,6 @@ class EntityTag(Base):
         return f"<EntityTag(tag={self.tag.name}, {self.entity_type}:{self.entity_id})>"
 
 
-class Watchlist(Base):
-    """Watchlist for monitoring products"""
-
-    __tablename__ = "watchlist"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    product_id: Mapped[int] = mapped_column(ForeignKey("product.id"), index=True)
-    product: Mapped["Product"] = relationship(
-        "Product", back_populates="watchlist_entries"
-    )
-    target_price: Mapped[float | None] = mapped_column(Float, nullable=True)
-    # Currency of target_price. Null means USD, which is what comparisons
-    # assumed before the column existed.
-    target_currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
-    notes: Mapped[str | None] = mapped_column(String, nullable=True)
-    active: Mapped[int] = mapped_column(Integer, default=1)
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now())
-
-    @property
-    def target_label(self) -> str:
-        """Target price as the user set it, e.g. ``"$800.00"`` or ``"800.00 EUR"``."""
-        if self.target_price is None:
-            return "-"
-        code = (self.target_currency or "USD").upper()
-        if code == "USD":
-            return f"${self.target_price:.2f}"
-        return f"{self.target_price:.2f} {code}"
-
-    def __repr__(self):
-        return f"<Watchlist(product={self.product.name}, target={self.target_label})>"
-
-
 def init_db(engine) -> None:
     """
     Create every table registered on ``Base.metadata``.
@@ -563,6 +639,14 @@ def init_db(engine) -> None:
     from . import audit  # noqa: F401  (registers AuditLog on Base.metadata)
 
     Base.metadata.create_all(engine)
+    # Record the base currency the moment the database exists, so data is
+    # never normalized to a currency the database does not name.
+    with engine.begin() as conn:
+        conn.execute(
+            insert(Setting)
+            .prefix_with("OR IGNORE")
+            .values(key=BASE_CURRENCY_KEY, value=DEFAULT_BASE_CURRENCY)
+        )
 
 
 if __name__ == "__main__":
@@ -573,8 +657,8 @@ if __name__ == "__main__":
     Base.metadata.create_all(engine)
 
     # fx
-    eur = Forex(code="EUR", usd_per_unit=1.085)
-    gbp = Forex(code="GBP", usd_per_unit=1.292)
+    eur = Forex(code="EUR", base_per_unit=1.085)
+    gbp = Forex(code="GBP", base_per_unit=1.292)
 
     # brands
     apple = Brand(name="Apple")
@@ -591,9 +675,9 @@ if __name__ == "__main__":
     session.add(apple_shop_nyc)
 
     # quotes
-    q1 = Quote(product=iphone_15, vendor=apple_shop_nyc, currency="USD", value=1200)
+    q1 = Quote(product=iphone_15, vendor=apple_shop_nyc, value=1200)
     session.add(q1)
-    q2 = Quote(product=iphone_14, vendor=apple_shop_nyc, currency="USD", value=1000)
+    q2 = Quote(product=iphone_14, vendor=apple_shop_nyc, value=1000)
     session.add(q2)
 
     # add products

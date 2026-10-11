@@ -421,7 +421,7 @@ def test_purchase_order_with_quote(dbsession):
     brand = Brand(name="Apple")
     product = Product(name="iPhone 15", brand=brand)
     vendor = Vendor(name="Amazon", currency="USD")
-    quote = Quote(product=product, vendor=vendor, currency="USD", value=999.99)
+    quote = Quote(product=product, vendor=vendor, value=999.99)
     dbsession.add_all([brand, product, vendor, quote])
     dbsession.flush()
 
@@ -513,7 +513,7 @@ def test_quote_creation(dbsession):
     brand = Brand(name="Apple")
     product = Product(name="iPhone 15", brand=brand)
     vendor = Vendor(name="Amazon", currency="USD")
-    quote = Quote(product=product, vendor=vendor, currency="USD", value=999.99)
+    quote = Quote(product=product, vendor=vendor, value=999.99)
     dbsession.add_all([brand, product, vendor, quote])
     dbsession.flush()
 
@@ -521,7 +521,6 @@ def test_quote_creation(dbsession):
     assert quote.product == product
     assert quote.vendor == vendor
     assert quote.value == 999.99
-    assert quote.currency == "USD"
 
 
 def test_quote_repr(dbsession):
@@ -529,7 +528,7 @@ def test_quote_repr(dbsession):
     brand = Brand(name="Apple")
     product = Product(name="iPhone 15", brand=brand)
     vendor = Vendor(name="Amazon", currency="USD")
-    quote = Quote(product=product, vendor=vendor, currency="USD", value=999.99)
+    quote = Quote(product=product, vendor=vendor, value=999.99)
     dbsession.add_all([brand, product, vendor, quote])
     dbsession.commit()
 
@@ -544,7 +543,6 @@ def test_quote_with_original_currency(dbsession):
     quote = Quote(
         product=product,
         vendor=vendor,
-        currency="USD",
         value=1250.0,
         original_value=1000.0,
         original_currency="GBP",
@@ -555,30 +553,29 @@ def test_quote_with_original_currency(dbsession):
     assert quote.original_value == 1000.0
     assert quote.original_currency == "GBP"
     assert quote.value == 1250.0
-    assert quote.currency == "USD"
 
 
 # Forex Tests
 def test_forex_creation(dbsession):
     """Test forex rate can be created"""
 
-    fx = Forex(code="EUR", usd_per_unit=1.085)
+    fx = Forex(code="EUR", base_per_unit=1.085)
     dbsession.add(fx)
     dbsession.flush()
 
     assert fx.id is not None
     assert fx.code == "EUR"
-    assert fx.usd_per_unit == 1.085
+    assert fx.base_per_unit == 1.085
     assert fx.date is not None
     # Test backward compatibility property
-    assert abs(fx.units_per_usd - (1.0 / 1.085)) < 0.001
+    assert abs(fx.units_per_base - (1.0 / 1.085)) < 0.001
 
 
 def test_forex_repr(dbsession):
     """Test forex string representation"""
     import datetime
 
-    fx = Forex(code="EUR", usd_per_unit=1.085, date=datetime.date(2025, 10, 17))
+    fx = Forex(code="EUR", base_per_unit=1.085, date=datetime.date(2025, 10, 17))
     dbsession.add(fx)
     dbsession.commit()
 
@@ -589,9 +586,9 @@ def test_forex_repr(dbsession):
 
 def test_forex_multiple_currencies(dbsession):
     """Test multiple forex rates can be stored"""
-    eur = Forex(code="EUR", usd_per_unit=1.085)
-    gbp = Forex(code="GBP", usd_per_unit=1.292)
-    jpy = Forex(code="JPY", usd_per_unit=0.0067)
+    eur = Forex(code="EUR", base_per_unit=1.085)
+    gbp = Forex(code="GBP", base_per_unit=1.292)
+    jpy = Forex(code="JPY", base_per_unit=0.0067)
     dbsession.add_all([eur, gbp, jpy])
     dbsession.commit()
 
@@ -603,9 +600,9 @@ def test_forex_historical_rates(dbsession):
     import datetime
 
     # Same currency, different dates
-    eur_today = Forex(code="EUR", usd_per_unit=1.085, date=datetime.date(2025, 10, 17))
+    eur_today = Forex(code="EUR", base_per_unit=1.085, date=datetime.date(2025, 10, 17))
     eur_yesterday = Forex(
-        code="EUR", usd_per_unit=1.080, date=datetime.date(2025, 10, 16)
+        code="EUR", base_per_unit=1.080, date=datetime.date(2025, 10, 16)
     )
     dbsession.add_all([eur_today, eur_yesterday])
     dbsession.commit()
@@ -615,23 +612,23 @@ def test_forex_historical_rates(dbsession):
     assert len(rates) == 2
 
 
-def test_forex_units_per_usd_property(dbsession):
+def test_forex_units_per_base_property(dbsession):
     """Test backward compatibility property calculation"""
-    fx = Forex(code="EUR", usd_per_unit=1.085)
+    fx = Forex(code="EUR", base_per_unit=1.085)
     dbsession.add(fx)
     dbsession.commit()
 
-    # units_per_usd should be 1/usd_per_unit
+    # units_per_base should be 1/base_per_unit
     expected = 1.0 / 1.085
-    assert abs(fx.units_per_usd - expected) < 0.001
+    assert abs(fx.units_per_base - expected) < 0.001
 
 
 # Integration Tests
 def test_full_workflow(dbsession):
     """Test complete workflow: brand -> product -> vendor -> quote"""
     # Create forex rates
-    eur = Forex(code="EUR", usd_per_unit=1.085)
-    gbp = Forex(code="GBP", usd_per_unit=1.292)
+    eur = Forex(code="EUR", base_per_unit=1.085)
+    gbp = Forex(code="GBP", base_per_unit=1.292)
 
     # Create vendors
     acme_corp = Vendor(
@@ -650,8 +647,8 @@ def test_full_workflow(dbsession):
     product_c = Product(name="productC", brand=microsoft)
 
     # Create price quotes
-    quote1 = Quote(product=product_a, vendor=acme_corp, currency="USD", value=280)
-    quote2 = Quote(product=product_a, vendor=amazon, currency="GBP", value=210)
+    quote1 = Quote(product=product_a, vendor=acme_corp, value=280)
+    quote2 = Quote(product=product_a, vendor=amazon, value=210)
 
     # Set up relationships
     acme_corp.brands = [yamaha, samsung]

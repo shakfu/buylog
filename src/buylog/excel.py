@@ -6,7 +6,6 @@ Supports reading and writing Excel files for:
 - Vendors, Products, Brands
 - Quotes, Purchase Orders
 - Specifications with features
-- Forex rates, Price alerts, Watchlists
 """
 
 import re
@@ -229,7 +228,7 @@ def export_quotes(session: Session, filepath: Union[str, Path]) -> int:
                 q.product.name,
                 q.product.brand.name if q.product.brand else "",
                 q.value,
-                q.currency,
+                q.base_currency,  # the currency of q.value
                 q.shipping_cost,
                 q.total_cost,
                 q.status,
@@ -441,7 +440,7 @@ def export_all(session: Session, filepath: Union[str, Path]) -> dict[str, int]:
                 q.vendor.name,
                 q.product.name,
                 q.value,
-                q.currency,
+                q.base_currency,  # the currency of q.value
                 q.shipping_cost,
                 q.total_cost,
                 q.status,
@@ -858,7 +857,7 @@ def import_vendors(
             VendorService.create(
                 session,
                 name=name,
-                currency=str(row[1] or "USD").strip(),
+                currency=str(row[1]).strip() if row[1] else None,
                 discount_code=str(row[2]).strip() if row[2] else None,
                 discount=_parse_float(row[3]),
                 url=str(row[4]).strip() if len(row) > 4 and row[4] else None,
@@ -1079,7 +1078,7 @@ def import_purchase_orders(
                 product_name=product_name,
                 quantity=_parse_int(row[3]) if len(row) > 3 else 1,
                 unit_price=_parse_float(row[4]),
-                currency=str(row[5]).strip() if len(row) > 5 and row[5] else "USD",
+                currency=str(row[5]).strip() if len(row) > 5 and row[5] else None,
                 shipping_cost=_parse_float(row[6]) if len(row) > 6 else None,
                 tax=_parse_float(row[7]) if len(row) > 7 else None,
                 order_date=_parse_date(row[8]) if len(row) > 8 else None,

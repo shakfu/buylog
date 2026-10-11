@@ -50,9 +50,8 @@ async def test_app_starts_and_builds_every_tab(tui):
             "vendors",
             "quotes",
             "forex",
-            "alerts",
+            "targets",
             "lists",
-            "watchlist",
             "specs",
             "pos",
         ):
@@ -101,8 +100,8 @@ async def test_quote_handler_uses_latest_forex_rate(tui):
     from buylog.services import QuoteService, VendorService
 
     session = tui.Session()
-    session.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.1))
-    session.add(Forex(code="EUR", date=datetime.date(2026, 2, 1), usd_per_unit=1.2))
+    session.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.1))
+    session.add(Forex(code="EUR", date=datetime.date(2026, 2, 1), base_per_unit=1.2))
     session.commit()
     VendorService.create(session, "EuroShop", currency="EUR")
     session.close()
@@ -157,28 +156,57 @@ async def test_forex_handler_rejects_duplicate_rate(tui):
         assert app.query_one("#forex-table", DataTable).row_count == 1
 
 
-async def test_watchlist_handler_stores_the_target_currency(seeded):
-    from buylog.services import WatchlistService
+async def test_target_handler_stores_the_currency(seeded):
+    from buylog.services import PriceTargetService
 
     app = seeded.BuyerApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        app._on_watchlist_added(("iPhone 15", 800.0, None, "eur"))
+        app._on_target_added(("iPhone 15", 800.0, "eur"))
         await pilot.pause()
 
-        (entry,) = WatchlistService.get_all(app.session)
-        assert entry.target_currency == "EUR"
-        assert entry.target_label == "800.00 EUR"
+        (target,) = PriceTargetService.get_all(app.session)
+        assert target.currency == "EUR"
+        assert target.label == "800.00 EUR"
 
 
-async def test_watchlist_form_returns_the_currency(seeded):
+async def test_target_handler_without_a_threshold_uses_considering(seeded):
+    from buylog.services import PriceTargetService, PurchaseListService
+
+    app = seeded.BuyerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._on_target_added(("iPhone 15", None, None))
+        await pilot.pause()
+
+        assert PriceTargetService.get_all(app.session) == []
+        assert len(PurchaseListService.might_buy(app.session)) == 1
+
+
+async def test_watch_key_prefills_the_selected_product(seeded):
+    from textual.widgets import Input
+
+    app = seeded.BuyerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_switch_tab("products-tab")
+        await pilot.pause()
+        app.action_watch()
+        await pilot.pause()
+
+        screen = app.screen
+        assert isinstance(screen, seeded.AddTargetScreen)
+        assert screen.query_one("#product-name", Input).value == "iPhone 15"
+
+
+async def test_target_form_returns_the_currency(seeded):
     from textual.widgets import Input
 
     app = seeded.BuyerApp()
     async with app.run_test() as pilot:
         await pilot.pause()
         results = []
-        screen = seeded.AddWatchlistScreen()
+        screen = seeded.AddTargetScreen()
         await app.push_screen(screen, results.append)
         await pilot.pause()
         screen.query_one("#product-name", Input).value = "iPhone 15"
@@ -187,4 +215,60 @@ async def test_watchlist_form_returns_the_currency(seeded):
         screen.action_save()
         await pilot.pause()
 
-        assert results == [("iPhone 15", 800.0, None, "EUR")]
+        assert results == [("iPhone 15", 800.0, "EUR")]
+
+
+async def test_tab_specific_keys_follow_the_active_tab(tui):
+    """Footer keys that do nothing on a tab are disabled there."""
+    app = tui.BuyerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_switch_tab("quotes-tab")
+        await pilot.pause()
+        assert app.check_action("set_status", ())
+        assert app.check_action("filter_quotes", ())
+        assert not app.check_action("open_url", ())
+
+        app.action_switch_tab("vendors-tab")
+        await pilot.pause()
+        assert app.check_action("open_url", ())
+        assert not app.check_action("set_status", ())
+
+        app.action_switch_tab("specs-tab")
+        await pilot.pause()
+        assert not app.check_action("delete", ())
+        assert app.check_action("add", ())
+
+
+async def test_next_tab_reaches_every_tab(tui):
+    """Regression: h/l skipped the Specs and POs tabs."""
+    from textual.widgets import TabbedContent
+
+    app = tui.BuyerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        seen = []
+        for _ in range(len(app.TAB_ORDER)):
+            seen.append(app.query_one(TabbedContent).active)
+            app.action_next_tab()
+            await pilot.pause()
+        assert sorted(seen) == sorted(pane.id for pane in app.query("TabPane"))
+
+
+async def test_targets_tab_shows_a_met_target_before_check(seeded):
+    """The TUI reads `met` live; only `check` marks a target triggered."""
+    from textual.widgets import DataTable
+
+    from buylog.services import PriceTargetService
+
+    session = seeded.Session()
+    PriceTargetService.create(session, "iPhone 15", 1000.0)
+    session.close()
+
+    app = seeded.BuyerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        row = app.query_one("#targets-table", DataTable).get_row_at(0)
+        assert str(row[3]) == "Met"
+        (target,) = PriceTargetService.get_all(app.session)
+        assert target.triggered_at is None

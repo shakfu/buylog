@@ -1,6 +1,6 @@
 [project]
 name = "buylog"
-version = "0.2.0"
+version = "0.3.0"
 description = "A purchasing support tool with CLI and TUI interfaces for vendor quote management."
 readme = "README.md"
 license = "MIT"

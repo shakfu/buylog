@@ -144,7 +144,7 @@ def run_git_command(args: list[str], check: bool = True) -> subprocess.Completed
 
 def create_git_tag(version: str) -> bool:
     """Create git tag for version."""
-    tag = f"v{version}"
+    tag = version
     try:
         result = run_git_command(["tag", tag])
         if result.returncode == 0:
@@ -160,7 +160,7 @@ def create_git_tag(version: str) -> bool:
 
 def push_git_tag(version: str) -> bool:
     """Push git tag to origin."""
-    tag = f"v{version}"
+    tag = version
     try:
         result = run_git_command(["push", "origin", tag])
         if result.returncode == 0:
@@ -183,7 +183,7 @@ def get_latest_tag() -> Optional[str]:
 
 def check_tag_exists(version: str) -> bool:
     """Check if tag already exists."""
-    tag = f"v{version}"
+    tag = version
     result = run_git_command(["tag", "-l", tag], check=False)
     return tag in result.stdout
 
@@ -217,9 +217,9 @@ def main() -> int:
     # No args - just display status
     if not args:
         if check_tag_exists(current_version):
-            print(f"Tag v{current_version} exists")
+            print(f"Tag {current_version} exists")
         else:
-            print(f"Tag v{current_version} does not exist")
+            print(f"Tag {current_version} does not exist")
         return 0
 
     command = args[0]
@@ -263,13 +263,13 @@ def main() -> int:
 
     elif command == "tag":
         if check_tag_exists(current_version):
-            print(f"Tag v{current_version} already exists")
+            print(f"Tag {current_version} already exists")
             push_anyway = input("Push existing tag? [y/N]: ").strip().lower()
             if push_anyway == "y":
                 return 0 if push_git_tag(current_version) else 1
             return 0
 
-        print(f"Will create and push tag: v{current_version}")
+        print(f"Will create and push tag: {current_version}")
         confirm = input("Proceed? [Y/n]: ").strip().lower()
         if confirm and confirm != "y":
             print("Aborted")

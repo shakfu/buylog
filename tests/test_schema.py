@@ -80,11 +80,11 @@ def test_migrations_enforce_unique_constraints(fresh_engine):
 
     with Session(fresh_engine) as session:
         session.add(
-            models.Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.1)
+            models.Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.1)
         )
         session.commit()
         session.add(
-            models.Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.2)
+            models.Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.2)
         )
         with pytest.raises(IntegrityError):
             session.commit()
@@ -180,7 +180,245 @@ def test_migrations_upgrade_an_older_schema(fresh_engine):
     quote_columns = {c["name"] for c in inspector.get_columns("quote")}
     assert "source_url" in quote_columns
     assert "original_currency" in quote_columns
-    assert "grand_total_usd" in {
+    assert "grand_total_base" in {
         c["name"] for c in inspector.get_columns("purchase_order")
     }
+    assert check_migrations(fresh_engine) == []
+
+
+def test_migrations_fold_alerts_and_watchlist_into_price_target(fresh_engine):
+    """0.2.0 rows survive: thresholds, watchlist notes, and target-less flags."""
+    from sqlalchemy import text
+    from sqlalchemy.orm import Session
+
+    models.init_db(fresh_engine)
+    with fresh_engine.begin() as conn:
+        # The 0.2.0 shapes. watchlist had no target_currency yet.
+        conn.execute(
+            text(
+                "CREATE TABLE price_alert (id INTEGER PRIMARY KEY, "
+                "product_id INTEGER, threshold_value REAL, threshold_currency TEXT, "
+                "active INTEGER, created_at DATETIME, triggered_at DATETIME)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE watchlist (id INTEGER PRIMARY KEY, product_id INTEGER, "
+                "target_price REAL, notes TEXT, active INTEGER, created_at DATETIME)"
+            )
+        )
+        conn.execute(text("INSERT INTO brand (id, name) VALUES (1, 'Apple')"))
+        conn.execute(
+            text(
+                "INSERT INTO product (id, name, brand_id) VALUES "
+                "(1, 'iPhone 15', 1), (2, 'iPad', 1)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO vendor (id, name, currency, discount) "
+                "VALUES (1, 'Amazon', 'USD', 0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO quote (id, product_id, vendor_id, value, "
+                "discount, created_at) "
+                "VALUES (1, 2, 1, 500, 0, '2026-01-01 00:00:00')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO price_alert (product_id, threshold_value, "
+                "threshold_currency, active, triggered_at) VALUES "
+                "(1, 900, 'eur', 1, '2026-01-01 00:00:00')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO watchlist (product_id, target_price, notes, active) "
+                "VALUES (1, 800, 'wait for sale', 1), (2, NULL, NULL, 1)"
+            )
+        )
+
+    run_migrations(fresh_engine)
+
+    tables = set(inspect(fresh_engine).get_table_names())
+    assert "price_alert" not in tables
+    assert "watchlist" not in tables
+    with Session(fresh_engine) as session:
+        targets = session.execute(
+            text(
+                "SELECT threshold, currency, triggered_at IS NOT NULL "
+                "FROM price_target ORDER BY threshold"
+            )
+        ).all()
+        notes = (
+            session.execute(text("SELECT content FROM note WHERE entity_id = 1"))
+            .scalars()
+            .all()
+        )
+        considering = session.execute(
+            text(
+                "SELECT plq.quote_id FROM purchase_list_quote plq "
+                "JOIN purchase_list pl ON pl.id = plq.purchase_list_id "
+                "WHERE pl.name = 'Considering'"
+            )
+        ).all()
+    # The alert keeps its fired state; the watchlist target starts armed.
+    assert [tuple(row) for row in targets] == [(800.0, "USD", 0), (900.0, "EUR", 1)]
+    assert notes == ["Watchlist note: wait for sale"]
+    assert [tuple(row) for row in considering] == [(1,)]
+    assert check_migrations(fresh_engine) == []
+
+
+def test_a_failed_copy_keeps_the_old_table(fresh_engine):
+    """The drop must not run when the copy before it failed."""
+    import pytest
+    from sqlalchemy import text
+
+    from buylog.migrate import MigrationError
+
+    models.init_db(fresh_engine)
+    with fresh_engine.begin() as conn:
+        # No threshold_value column, so the copy's SELECT fails.
+        conn.execute(
+            text(
+                "CREATE TABLE price_alert (id INTEGER PRIMARY KEY, product_id INTEGER)"
+            )
+        )
+
+    with pytest.raises(MigrationError, match="skipped"):
+        run_migrations(fresh_engine)
+
+    assert "price_alert" in inspect(fresh_engine).get_table_names()
+
+
+def test_orphaned_alert_rows_do_not_block_the_fold(fresh_engine):
+    from sqlalchemy import text
+
+    models.init_db(fresh_engine)
+    with fresh_engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE price_alert (id INTEGER PRIMARY KEY, "
+                "product_id INTEGER, threshold_value REAL, threshold_currency TEXT, "
+                "active INTEGER, created_at DATETIME, triggered_at DATETIME)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO price_alert (product_id, threshold_value) VALUES (42, 900)"
+            )
+        )
+
+    run_migrations(fresh_engine)
+
+    assert "price_alert" not in inspect(fresh_engine).get_table_names()
+
+
+def test_migrations_derive_quote_status(fresh_engine):
+    """A stored status becomes the order or list entry it is derived from."""
+    from sqlalchemy import text
+    from sqlalchemy.orm import Session
+
+    models.init_db(fresh_engine)
+    with fresh_engine.begin() as conn:
+        conn.execute(text("ALTER TABLE quote ADD COLUMN status VARCHAR"))
+        conn.execute(text("CREATE INDEX ix_quote_status ON quote (status)"))
+        conn.execute(text("INSERT INTO brand (id, name) VALUES (1, 'Apple')"))
+        conn.execute(
+            text("INSERT INTO product (id, name, brand_id) VALUES (1, 'iPhone', 1)")
+        )
+        conn.execute(
+            text(
+                "INSERT INTO vendor (id, name, currency, discount) "
+                "VALUES (1, 'Amazon', 'USD', 0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO quote (id, product_id, vendor_id, value, "
+                "discount, shipping_cost, tax_rate, created_at, status) VALUES "
+                # 90 after 10% off, + 10 shipping, + 10% tax on both: 110.0
+                "(1, 1, 1, 100, 10, 10, 10, '2026-01-01', 'ordered'), "
+                "(2, 1, 1, 200, 0, NULL, NULL, '2026-01-01', 'considering'), "
+                # Stored 'ordered', but its only order was cancelled.
+                "(3, 1, 1, 300, 0, NULL, NULL, '2026-01-01', 'ordered'), "
+                "(4, 1, 1, 400, 0, NULL, NULL, '2026-01-01', 'received')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO purchase_order (quote_id, vendor_id, product_id, "
+                "po_number, status, quantity, unit_price, currency, total_amount, "
+                "grand_total, created_at) VALUES "
+                "(3, 1, 1, 'quote-3', 'cancelled', 1, 300, 'USD', 300, 300, "
+                "'2026-01-02')"
+            )
+        )
+
+    run_migrations(fresh_engine)
+
+    assert "status" not in {
+        c["name"] for c in inspect(fresh_engine).get_columns("quote")
+    }
+    with Session(fresh_engine) as session:
+        orders = session.execute(
+            text(
+                "SELECT quote_id, po_number, status, round(grand_total, 2) "
+                "FROM purchase_order ORDER BY quote_id"
+            )
+        ).all()
+        statuses = dict(
+            session.execute(models.select(models.Quote.id, models.Quote.status))
+            .tuples()
+            .all()
+        )
+    assert [tuple(row) for row in orders] == [
+        (1, "quote-1", "ordered", 110.0),
+        (3, "quote-3", "cancelled", 300.0),
+        (4, "quote-4", "received", 400.0),
+    ]
+    assert statuses == {1: "ordered", 2: "considering", 3: None, 4: "received"}
+    assert check_migrations(fresh_engine) == []
+
+
+def test_migrations_drop_quote_currency(fresh_engine):
+    """The column goes; a value other than USD survives as a quote note."""
+    from sqlalchemy import text
+    from sqlalchemy.orm import Session
+
+    models.init_db(fresh_engine)
+    with fresh_engine.begin() as conn:
+        conn.execute(text("ALTER TABLE quote ADD COLUMN currency VARCHAR"))
+        conn.execute(text("INSERT INTO brand (id, name) VALUES (1, 'Apple')"))
+        conn.execute(
+            text("INSERT INTO product (id, name, brand_id) VALUES (1, 'iPhone', 1)")
+        )
+        conn.execute(
+            text(
+                "INSERT INTO vendor (id, name, currency, discount) "
+                "VALUES (1, 'Amazon', 'GBP', 0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO quote (id, product_id, vendor_id, currency, value, "
+                "discount, created_at) VALUES "
+                "(1, 1, 1, 'USD', 100, 0, '2026-01-01'), "
+                "(2, 1, 1, 'GBP', 200, 0, '2026-01-01')"
+            )
+        )
+
+    run_migrations(fresh_engine)
+
+    assert "currency" not in {
+        c["name"] for c in inspect(fresh_engine).get_columns("quote")
+    }
+    with Session(fresh_engine) as session:
+        notes = session.execute(
+            text("SELECT entity_id, content FROM note WHERE entity_type = 'quote'")
+        ).all()
+    assert [tuple(row) for row in notes] == [(2, "Currency before migration: GBP")]
     assert check_migrations(fresh_engine) == []

@@ -1,7 +1,7 @@
 """Tests for the automation and analytics services.
 
 Covers `buylog check` (MonitorService), `buylog fx refresh`
-(ForexRefreshService), `buylog scrape refresh` (ScrapeRefreshService) and
+(ForexRefreshService), `buylog quote refresh` (ScrapeRefreshService) and
 `buylog spend` (SpendAnalyticsService).
 """
 
@@ -9,7 +9,7 @@ import datetime
 
 import pytest
 
-from buylog.models import Forex, PriceAlert, Watchlist
+from buylog.models import Forex
 from buylog.services import (
     ForexRefreshService,
     MonitorService,
@@ -21,8 +21,8 @@ from buylog.services import (
     ScrapeRefreshService,
     ServiceError,
     SpendAnalyticsService,
+    PriceTargetService,
     VendorService,
-    WatchlistService,
 )
 
 
@@ -44,7 +44,7 @@ class FakeResponse:
 
 
 # ForexRefreshService
-def test_fetch_rates_inverts_units_per_usd(monkeypatch):
+def test_fetch_rates_inverts_units_per_base(monkeypatch):
     """The API quotes units-per-USD; we store USD-per-unit."""
     captured = {}
 
@@ -99,7 +99,7 @@ def test_refresh_stores_rates_for_vendor_currencies(dbsession, monkeypatch):
 
     assert stats["updated"] == ["EUR"]
     rate = dbsession.query(Forex).filter_by(code="EUR").one()
-    assert rate.usd_per_unit == pytest.approx(1.25)
+    assert rate.base_per_unit == pytest.approx(1.25)
     assert rate.date == datetime.date(2026, 3, 1)
 
 
@@ -133,106 +133,87 @@ def test_refresh_reports_a_currency_the_api_omits(dbsession, monkeypatch):
 
 
 # MonitorService
-def test_check_reports_a_triggered_alert(dbsession):
-    from buylog.services import PriceAlertService
-
+def _quote(dbsession, price):
     VendorService.create(dbsession, "Amazon")
-    QuoteService.create(dbsession, "Amazon", "iPhone 15", 899.0, brand_name="Apple")
-    PriceAlertService.create(dbsession, "iPhone 15", 900.0)
+    QuoteService.create(dbsession, "Amazon", "iPhone 15", price, brand_name="Apple")
+
+
+def test_check_reports_a_met_target(dbsession):
+    _quote(dbsession, 899.0)
+    PriceTargetService.create(dbsession, "iPhone 15", 900.0)
 
     findings = MonitorService.check(dbsession)
 
-    assert len(findings["alerts"]) == 1
+    assert len(findings["targets"]) == 1
     assert "iPhone 15" in findings["messages"][0]
     assert "899.00" in findings["messages"][0]
+    assert "$900.00" in findings["messages"][0]
 
 
-def test_check_ignores_an_alert_above_the_price(dbsession):
-    from buylog.services import PriceAlertService
+def test_check_ignores_a_target_below_the_price(dbsession):
+    _quote(dbsession, 999.0)
+    PriceTargetService.create(dbsession, "iPhone 15", 900.0)
 
-    VendorService.create(dbsession, "Amazon")
-    QuoteService.create(dbsession, "Amazon", "iPhone 15", 999.0, brand_name="Apple")
-    PriceAlertService.create(dbsession, "iPhone 15", 900.0)
-
-    assert MonitorService.check(dbsession)["alerts"] == []
+    assert MonitorService.check(dbsession)["targets"] == []
 
 
-def test_check_reports_a_met_watchlist_target(dbsession):
-    VendorService.create(dbsession, "Amazon")
-    QuoteService.create(dbsession, "Amazon", "iPhone 15", 750.0, brand_name="Apple")
-    WatchlistService.create(dbsession, "iPhone 15", target_price=800.0)
+def test_check_fires_a_target_once(dbsession):
+    """Regression: a met watchlist target was re-sent on every cron run."""
+    _quote(dbsession, 750.0)
+    PriceTargetService.create(dbsession, "iPhone 15", 800.0)
 
-    findings = MonitorService.check(dbsession)
-
-    assert len(findings["watchlist"]) == 1
-    assert "Watchlist" in findings["messages"][0]
+    assert len(MonitorService.check(dbsession)["targets"]) == 1
+    assert MonitorService.check(dbsession)["targets"] == []
 
 
-def test_check_converts_a_foreign_watchlist_target(dbsession):
+def test_check_fires_again_after_an_edit(dbsession):
+    _quote(dbsession, 750.0)
+    target = PriceTargetService.create(dbsession, "iPhone 15", 800.0)
+    MonitorService.check(dbsession)
+
+    PriceTargetService.update(dbsession, target.id, threshold=760.0)
+
+    assert len(MonitorService.check(dbsession)["targets"]) == 1
+
+
+def test_check_converts_a_foreign_target(dbsession):
     """100 EUR at 1.25 is $125, so a $110 price meets the target."""
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.25))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.25))
     dbsession.commit()
-    VendorService.create(dbsession, "Amazon")
-    QuoteService.create(dbsession, "Amazon", "iPhone 15", 110.0, brand_name="Apple")
-    WatchlistService.create(
-        dbsession, "iPhone 15", target_price=100.0, target_currency="EUR"
-    )
+    _quote(dbsession, 110.0)
+    PriceTargetService.create(dbsession, "iPhone 15", 100.0, "EUR")
 
     findings = MonitorService.check(dbsession)
 
-    assert len(findings["watchlist"]) == 1
+    assert len(findings["targets"]) == 1
     assert "100.00 EUR" in findings["messages"][0]
 
 
 def test_check_does_not_treat_a_foreign_target_as_dollars(dbsession):
     """100 EUR at 0.50 is $50. A $90 price is under 100 and over $50."""
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=0.5))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=0.5))
     dbsession.commit()
-    VendorService.create(dbsession, "Amazon")
-    QuoteService.create(dbsession, "Amazon", "iPhone 15", 90.0, brand_name="Apple")
-    WatchlistService.create(
-        dbsession, "iPhone 15", target_price=100.0, target_currency="EUR"
-    )
+    _quote(dbsession, 90.0)
+    PriceTargetService.create(dbsession, "iPhone 15", 100.0, "EUR")
 
-    assert MonitorService.check(dbsession)["watchlist"] == []
+    assert MonitorService.check(dbsession)["targets"] == []
 
 
-def test_check_skips_a_watchlist_target_with_no_rate(dbsession):
-    VendorService.create(dbsession, "Amazon")
-    QuoteService.create(dbsession, "Amazon", "iPhone 15", 50.0, brand_name="Apple")
-    WatchlistService.create(
-        dbsession, "iPhone 15", target_price=100.0, target_currency="EUR"
-    )
+def test_check_skips_a_target_with_no_rate(dbsession):
+    _quote(dbsession, 50.0)
+    target = PriceTargetService.create(dbsession, "iPhone 15", 100.0, "EUR")
 
-    assert MonitorService.check(dbsession)["watchlist"] == []
-
-
-def test_check_ignores_a_watchlist_entry_without_a_target(dbsession):
-    """A row left over with no target is not a price check."""
-    VendorService.create(dbsession, "Amazon")
-    QuoteService.create(dbsession, "Amazon", "iPhone 15", 750.0, brand_name="Apple")
-    product = ProductService.get_by_name(dbsession, "iPhone 15")
-    dbsession.add(Watchlist(product_id=product.id, target_price=None, active=1))
-    dbsession.commit()
-
-    assert MonitorService.check(dbsession)["watchlist"] == []
+    assert MonitorService.check(dbsession)["targets"] == []
+    # Skipped, not used up: it fires once a rate exists.
+    assert target.triggered_at is None
 
 
-def test_check_converts_a_foreign_threshold(dbsession):
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.2))
-    dbsession.commit()
-    VendorService.create(dbsession, "Amazon")
-    QuoteService.create(dbsession, "Amazon", "iPhone 15", 110.0, brand_name="Apple")
-    product = ProductService.get_by_name(dbsession, "iPhone 15")
-    dbsession.add(
-        PriceAlert(
-            product_id=product.id, threshold_value=100.0, threshold_currency="EUR"
-        )
-    )
-    dbsession.commit()
+def test_check_ignores_an_inactive_target(dbsession):
+    _quote(dbsession, 50.0)
+    target = PriceTargetService.create(dbsession, "iPhone 15", 100.0)
+    PriceTargetService.deactivate(dbsession, target.id)
 
-    # 100 EUR is 120 USD, so a 110 USD price is under the threshold.
-    assert len(MonitorService.check(dbsession)["alerts"]) == 1
+    assert MonitorService.check(dbsession)["targets"] == []
 
 
 def test_check_on_an_empty_database_finds_nothing(dbsession):
@@ -312,7 +293,7 @@ def test_scrape_refresh_reports_a_dead_link_without_stopping(dbsession, monkeypa
 
 
 def test_scrape_refresh_converts_a_foreign_scraped_price(dbsession, monkeypatch):
-    dbsession.add(Forex(code="GBP", date=datetime.date(2026, 1, 1), usd_per_unit=1.25))
+    dbsession.add(Forex(code="GBP", date=datetime.date(2026, 1, 1), base_per_unit=1.25))
     dbsession.commit()
     VendorService.create(dbsession, "UKShop")
     quote = QuoteService.create(
@@ -461,7 +442,7 @@ def test_summary_on_an_empty_database(dbsession):
 
 
 def test_spend_uses_usd_totals_for_foreign_orders(dbsession):
-    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), usd_per_unit=1.2))
+    dbsession.add(Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.2))
     dbsession.commit()
     VendorService.create(dbsession, "EuroShop", currency="EUR")
     ProductService.create(dbsession, "TV", "Sony")

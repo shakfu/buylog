@@ -1,6 +1,8 @@
-"""Tests for workflow features: purchase lists, status, notes, tags, and watchlist."""
+"""Tests for workflow features: purchase lists, status, notes, and tags."""
 
 import datetime
+
+from sqlalchemy import select
 
 import pytest
 
@@ -21,7 +23,6 @@ from buylog.services import (
     SpendAnalyticsService,
     NoteService,
     TagService,
-    WatchlistService,
     NotFoundError,
     DuplicateError,
     ValidationError,
@@ -66,7 +67,6 @@ def quote(dbsession, product, vendor):
     quote = Quote(
         product=product,
         vendor=vendor,
-        currency="USD",
         value=100.0,
     )
     dbsession.add(quote)
@@ -80,7 +80,6 @@ def quote2(dbsession, product, vendor):
     quote = Quote(
         product=product,
         vendor=vendor,
-        currency="USD",
         value=150.0,
     )
     dbsession.add(quote)
@@ -229,14 +228,11 @@ class TestPurchaseListService:
         assert quote.status is None
         assert PurchaseListService.might_buy(dbsession) == []
 
-    def test_watchlist_without_a_target_uses_the_considering_list(
-        self, dbsession, quote
-    ):
+    def test_considering_a_product_uses_the_considering_list(self, dbsession, quote):
         quotes = PurchaseListService.consider_product(dbsession, quote.product.name)
 
         assert [item.id for item in quotes] == [quote.id]
         assert quote.status == QUOTE_STATUS_CONSIDERING
-        assert WatchlistService.get_active(dbsession) == []
         assert [item.id for item in PurchaseListService.might_buy(dbsession)] == [
             quote.id
         ]
@@ -291,6 +287,45 @@ class TestQuoteStatus:
         assert len(considering) >= 1
         assert all(q.status == "ordered" for q in ordered)
         assert all(q.status == "considering" for q in considering)
+
+    # Drift paths from docs/dev/261011-model.md, section 1. Status used to be
+    # stored, and these writers did not update it.
+    def test_cancelling_the_order_clears_ordered(self, dbsession, quote):
+        QuoteService.set_status(dbsession, quote.id, "ordered")
+        PurchaseOrderService.update_status(dbsession, f"quote-{quote.id}", "cancelled")
+        assert quote.status is None
+
+    def test_cancelling_the_order_returns_a_listed_quote_to_considering(
+        self, dbsession, quote
+    ):
+        QuoteService.set_status(dbsession, quote.id, "considering")
+        QuoteService.set_status(dbsession, quote.id, "ordered")
+        assert PurchaseListService.might_buy(dbsession) == []
+
+        PurchaseOrderService.update_status(dbsession, f"quote-{quote.id}", "cancelled")
+
+        assert quote.status == QUOTE_STATUS_CONSIDERING
+        assert PurchaseListService.might_buy(dbsession) == [quote]
+
+    def test_receiving_the_order_marks_the_quote_received(self, dbsession, quote):
+        QuoteService.set_status(dbsession, quote.id, "ordered")
+        PurchaseOrderService.update_status(dbsession, f"quote-{quote.id}", "received")
+        assert quote.status == QUOTE_STATUS_RECEIVED
+
+    def test_an_order_from_the_quote_marks_it_ordered(self, dbsession, quote):
+        PurchaseOrderService.create_from_quote(dbsession, "PO-1", quote.id)
+        assert quote.status == QUOTE_STATUS_ORDERED
+        assert QuoteService.get_by_status(dbsession, "ordered") == [quote]
+
+    def test_query_and_property_agree(self, dbsession, quote, quote2):
+        """The SQL expression and the Python getter derive the same status."""
+        QuoteService.set_status(dbsession, quote.id, "received")
+        QuoteService.set_status(dbsession, quote2.id, "considering")
+        for status in (QUOTE_STATUS_RECEIVED, QUOTE_STATUS_CONSIDERING):
+            found = QuoteService.get_by_status(dbsession, status)
+            assert found and all(q.status == status for q in found)
+        rows = dict(dbsession.execute(select(Quote.id, Quote.status)).tuples().all())
+        assert rows == {quote.id: "received", quote2.id: "considering"}
 
     def test_ordered_quote_is_counted_as_spend(self, dbsession, quote):
         """A quote marked ordered is a purchase, so spend has to see it."""
@@ -543,77 +578,14 @@ class TestTagService:
         assert entities[0].entity_type == "product"
 
 
-# =============================================================================
-# Watchlist Tests
-# =============================================================================
+def test_migration_prices_an_order_like_ensure_for_quote(dbsession, quote):
+    """The migration's SQL total must match the service's for the same quote."""
+    quote.value = 100.0
+    quote.discount = 10.0
+    quote.shipping_cost = 10.0
+    quote.tax_rate = 10.0
+    dbsession.commit()
 
+    po = PurchaseOrderService.ensure_for_quote(dbsession, quote, "ordered")
 
-class TestWatchlistService:
-    """Tests for WatchlistService."""
-
-    def test_add_to_watchlist(self, dbsession, product):
-        """Test adding a product to watchlist."""
-        watchlist = WatchlistService.create(
-            dbsession, product.name, target_price=50.0, notes="Wait for sale"
-        )
-        assert watchlist.product_id == product.id
-        assert watchlist.target_price == 50.0
-        assert watchlist.target_currency == "USD"
-        assert watchlist.notes == "Wait for sale"
-        assert watchlist.active == 1
-
-    def test_target_currency_is_stored(self, dbsession, product):
-        watchlist = WatchlistService.create(
-            dbsession, product.name, target_price=800.0, target_currency="eur"
-        )
-        assert watchlist.target_currency == "EUR"
-        assert watchlist.target_label == "800.00 EUR"
-
-    def test_bad_currency_code_raises(self, dbsession, product):
-        with pytest.raises(ValidationError):
-            WatchlistService.create(
-                dbsession, product.name, target_price=10.0, target_currency="EURO"
-            )
-
-    def test_a_watchlist_entry_needs_a_target_price(self, dbsession, product):
-        with pytest.raises(ValidationError):
-            WatchlistService.create(dbsession, product.name)
-
-    def test_add_duplicate_to_watchlist_raises(self, dbsession, product):
-        """Test adding duplicate product raises error."""
-        WatchlistService.create(dbsession, product.name, target_price=10.0)
-        with pytest.raises(DuplicateError):
-            WatchlistService.create(dbsession, product.name, target_price=10.0)
-
-    def test_add_nonexistent_product_raises(self, dbsession):
-        """Test adding nonexistent product raises error."""
-        with pytest.raises(NotFoundError):
-            WatchlistService.create(dbsession, "NonexistentProduct")
-
-    def test_get_active_watchlist(self, dbsession, product):
-        """Test getting active watchlist items."""
-        WatchlistService.create(dbsession, product.name, target_price=10.0)
-        active = WatchlistService.get_active(dbsession)
-        assert len(active) >= 1
-
-    def test_update_watchlist(self, dbsession, product):
-        """Test updating watchlist entry."""
-        watchlist = WatchlistService.create(dbsession, product.name, target_price=100.0)
-        updated = WatchlistService.update(
-            dbsession, watchlist.id, target_price=75.0, notes="New notes"
-        )
-        assert updated.target_price == 75.0
-        assert updated.notes == "New notes"
-
-    def test_deactivate_watchlist(self, dbsession, product):
-        """Test deactivating watchlist entry."""
-        watchlist = WatchlistService.create(dbsession, product.name, target_price=10.0)
-        deactivated = WatchlistService.deactivate(dbsession, watchlist.id)
-        assert deactivated.active == 0
-
-    def test_delete_watchlist(self, dbsession, product):
-        """Test deleting watchlist entry."""
-        watchlist = WatchlistService.create(dbsession, product.name, target_price=10.0)
-        WatchlistService.delete(dbsession, watchlist.id)
-        all_items = WatchlistService.get_all(dbsession)
-        assert not any(w.id == watchlist.id for w in all_items)
+    assert po.grand_total == pytest.approx(110.0)

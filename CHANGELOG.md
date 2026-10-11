@@ -6,27 +6,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0]
+
 ### Upgrading
 
-`watchlist.target_currency` is a new nullable column, and `vendor.website` is removed. Run:
+`price_alert` and `watchlist` are replaced by `price_target`. `quote.status`, `quote.currency` and `vendor.website` are removed. `forex.usd_per_unit` is renamed `base_per_unit` and `purchase_order.grand_total_usd` is renamed `grand_total_base`, with their values kept. A new `setting` table records the base currency; an existing database records USD, which is what its amounts are in. Run:
 
 ```sh
-buylog migrate
+buylog db migrate --dry-run   # review
+buylog db migrate
 ```
 
-Existing watchlist rows keep working. A missing currency is treated as USD, which is what the old comparison assumed.
+Every alert and every watchlist row with a target becomes a price target. A watchlist target with no currency becomes USD, which is what the old comparison assumed. Watchlist notes become product notes. A watchlist row with no target was only a flag, so that product's quotes go on the Considering list. Rows for a product that no longer exists are dropped. A fired alert stays fired. A watchlist target starts armed, so a met target notifies once more on the next `check`.
+
+A quote's stored status becomes the record it is now derived from. A quote marked `ordered` or `received` with no purchase order gets one, numbered `quote-<id>` and noted "Recorded by migration from the quote status". It has no order date, so spend counts it under the quote's creation date. A quote whose only order was cancelled gets none; it was marked ordered before the cancel. A `considering` quote on no list goes on the Considering list.
+
+`quote.currency` was always USD, the currency of `quote.value`. The currency as entered is still in `original_currency`. A row with any other value keeps it as a quote note. Exports still have a Currency column for quotes, filled with the base currency.
 
 A vendor's `website` is copied into `url` when `url` is blank, and the column is then dropped. When both were set and differ, `url` remains and the old website is kept as a vendor note.
 
+The CLI command tree changed and the old names are not aliased. `buylog check`, `spend`, `fx refresh` and `tui` are unchanged, so cron entries keep working. `docs/dev/261011-cli.md` maps every old command to its new form.
+
+A webhook or script that reads the `buylog check` payload must read its `targets` key; `alerts` and `watchlist` are gone.
+
+Python callers: `PriceTargetService` replaces `PriceAlertService` and `WatchlistService`, `ForexService.to_usd` is `to_base`, and `QuoteService.update` no longer takes `status`.
+
+### Added
+
+- **One base currency per database, chosen at creation.** `buylog db init --base JPY` sets the currency every amount is normalized to. It defaults to USD, and it is refused once quotes, orders, price history or forex rates exist, because those are stored relative to the base. The base is stored in the database rather than in configuration, so a database is never read in a currency it was not normalized to. Forex rates are units of the base per unit, `fx refresh` fetches them against the base, and prices print in the base. A vendor or price target with no currency takes the base. `buylog db seed` needs a USD database, since its sample rates are USD. Design: `docs/dev/261011-model.md`, section 4.
+
 ### Fixed
 
-- **Marking a quote ordered or received did not record a purchase.** `buylog spend` reads purchase orders, and `QuoteService.set_status` only wrote the quote's status, so a purchase recorded with `buylog status set` never appeared in spend. `ordered` and `received` now ensure one active purchase order for that quote, created as `quote-<id>` when none exists, with a total that includes the quote's discount, shipping, and tax. An existing order is advanced when the new status is further along, and is not moved backwards, so a shipped order stays shipped. A quote with an active order cannot be set back to `considering`; cancel the order first.
+- **A purchase order imported or created from a template without a currency was priced in USD.** The spreadsheet importer and the YAML/JSON template defaulted the currency to USD, overriding the vendor's currency, which `PurchaseOrderService.create` already falls back to. A EUR vendor's order was recorded as USD. They now leave it unset.
 
-- **Watchlist targets were compared to USD prices as bare numbers.** A target of 100 EUR was treated as $100. Targets now store a currency, and `MonitorService` converts them with `ForexService.to_usd`, the same path price alerts use. A target whose currency has no rate on file is skipped. `buylog watchlist add` and `update` take `--currency` (default USD), and the TUI watchlist form has a Currency field.
+- **A purchase order's total printed with `$` in any currency.** `po add` and the TUI's purchase order table and confirmation formatted `grand_total`, which is in the order's own currency, as dollars. They now print the order's currency.
+
+- **`buylog restore` exited 0 when the restore failed.** Errors other than a missing file were printed, and then the command returned success. `buylog db restore` now returns 1.
+
+- **Marking a quote ordered or received did not record a purchase.** `buylog spend` reads purchase orders, and `QuoteService.set_status` only wrote the quote's status, so a purchase recorded with `buylog status set` (now `buylog quote status`) never appeared in spend. `ordered` and `received` now ensure one active purchase order for that quote, created as `quote-<id>` when none exists, with a total that includes the quote's discount, shipping, and tax. An existing order is advanced when the new status is further along, and is not moved backwards, so a shipped order stays shipped. A quote with an active order cannot be set back to `considering`; cancel the order first.
+
+- **Watchlist targets were compared to USD prices as bare numbers.** A target of 100 EUR was treated as $100. Every price target now stores a currency and is converted with `ForexService.to_base` before comparison. A target whose currency has no rate on file is skipped, and fires once a rate exists.
+
+- **A met watchlist target notified on every `buylog check`.** Alerts set `triggered_at` and fired once, but watchlist targets had no such field, so a daily cron job re-sent the same target every day. Price targets fire once, and `buylog watch edit` re-arms one.
+
+- **A quote's status could disagree with its purchase order.** Status was stored on the quote and copied by some writers but not others. Cancelling or receiving an order left the quote `ordered`, so a cancelled purchase was missing from `might-buy`. `po add --from-quote` left the quote's old status. `QuoteService.update(status=...)` set it without creating an order. Status is now derived: `received` or `ordered` from an order that is not cancelled, otherwise `considering` from purchase-list membership. `QuoteService.update` no longer takes `status`; use `set_status`. Design: `docs/dev/261011-model.md`, section 1.
+
+- **A price edit in the TUI used up a price target without notifying.** `QuoteService.update_price` fired matching targets itself, so `buylog check` never reported them. Only `check` fires a target now, and `triggered_at` means the user was notified. The TUI reads whether a target is met from current prices, so its Targets tab shows Met before `check` runs.
+
+- **`buylog db migrate` could drop a table whose data it had failed to copy.** `run_migrations` continues past a failed statement, so the `DROP` after a failed copy still ran. A `DROP` now runs only when every statement before it succeeded.
 
 ### Changed
 
-- **One answer for what you might buy.** A purchase list of quotes is that answer. `buylog purchase-list might-buy` lists quotes that are on a list and not yet ordered or received. Adding a quote to a list marks it `considering`. Removing it from its last list clears that status. `buylog status set considering` puts the quote on a list named Considering. `buylog watchlist add` without `--target-price` does the same for every quote of that product, instead of storing a second flag. A watchlist entry still needs a target price; that remains the price threshold.
+- **CLI commands are `buylog <noun> <verb>`.** There were 35 top-level commands in three grammars. `add` chose an entity from which flags were set, `po create` was noun first, and `add-fx` was its own command. There are now 18 nouns. Each uses the same verbs where they apply: `add`, `list`, `show`, `edit`, `rm`. Side commands moved under the noun they act on, e.g. `clipboard quote 7` is now `quote copy 7` and `vendor-url open V` is now `vendor open V`. Admin commands are grouped under `db` and `data`. `-y` is accepted after the command as well as before it. A noun with no verb prints that noun's help. Mapping and decisions: `docs/dev/261011-cli.md`.
+
+- **One price target instead of alerts and a watchlist.** Both tables held a product, a threshold, a currency and an on/off flag, and `buylog check` evaluated them in two loops with two message formats. `price_target` replaces them, `buylog watch` replaces `buylog alert` and `buylog watchlist`, and the TUI has one Targets tab instead of Alerts and Watchlist. `buylog purchase-list consider PRODUCT` replaces `watchlist add` without a target. The `check` notification payload has one `targets` key instead of `alerts` and `watchlist`. Design: `docs/dev/261011-model.md`.
+
+- **TUI footer shows only keys that work on the current tab.** `t`, `f`, `o`, `y`, `w`, `e` and `d` each work on only some tabs, but the footer used to show them on every tab. `h`/`l` now reach the Specs and POs tabs, and `Ctrl+1` to `Ctrl+9` switch to each of the 9 tabs. `s` is removed: `/` focuses search and Enter runs it.
+
+- **One answer for what you might buy.** A purchase list of quotes is that answer. `buylog purchase-list might-buy` lists quotes that are on a list and not yet ordered or received. Adding a quote to a list marks it `considering`. Removing it from its last list clears that status. `buylog quote status ID considering` puts the quote on a list named Considering. `buylog purchase-list consider PRODUCT` does the same for every quote of that product, instead of storing a second flag.
 
 - **Compare and spend share one product classification.** The label is `Product.category` when it is set, otherwise the specification name, otherwise the product's tags. A product filed only with a tag or a specification now shows up in `buylog compare --category` and `buylog spend category`. A category that is already set stays the label, so a tag does not split the same purchase across two buckets.
 

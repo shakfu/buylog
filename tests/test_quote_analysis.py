@@ -1,4 +1,4 @@
-"""Tests for quote analysis features: best prices, history tracking, and price alerts"""
+"""Tests for quote analysis features: best prices, history tracking, and price targets"""
 
 import pytest
 from buylog.services import (
@@ -6,7 +6,8 @@ from buylog.services import (
     VendorService,
     QuoteService,
     QuoteHistoryService,
-    PriceAlertService,
+    PriceTargetService,
+    DuplicateError,
     ComparisonService,
     SpecificationService,
     TagService,
@@ -194,32 +195,32 @@ class TestQuoteHistoryService:
         assert trend == "new"
 
 
-# PriceAlertService tests
-class TestPriceAlertService:
-    """Tests for PriceAlertService"""
+# PriceTargetService tests
+class TestPriceTargetService:
+    """Tests for PriceTargetService"""
 
     def test_create_alert(self, dbsession):
         """Create a price alert"""
         ProductService.create(dbsession, "iPhone 15", "Apple")
 
-        alert = PriceAlertService.create(dbsession, "iPhone 15", 900.0)
+        alert = PriceTargetService.create(dbsession, "iPhone 15", 900.0)
 
         assert alert.id is not None
-        assert alert.threshold_value == 900.0
+        assert alert.threshold == 900.0
         assert alert.active == 1
         assert alert.triggered_at is None
 
     def test_create_alert_product_not_found(self, dbsession):
         """Create alert for non-existent product raises error"""
         with pytest.raises(NotFoundError, match="not found"):
-            PriceAlertService.create(dbsession, "NonExistent", 900.0)
+            PriceTargetService.create(dbsession, "NonExistent", 900.0)
 
     def test_create_alert_invalid_threshold(self, dbsession):
         """Create alert with invalid threshold raises error"""
         ProductService.create(dbsession, "iPhone 15", "Apple")
 
         with pytest.raises(ValidationError, match="positive"):
-            PriceAlertService.create(dbsession, "iPhone 15", -100.0)
+            PriceTargetService.create(dbsession, "iPhone 15", -100.0)
 
     def test_check_alerts_triggers(self, dbsession):
         """Check alerts triggers when price drops below threshold"""
@@ -227,14 +228,14 @@ class TestPriceAlertService:
         ProductService.create(dbsession, "iPhone 15", "Apple")
         quote = QuoteService.create(dbsession, "Amazon", "iPhone 15", 999.0)
 
-        alert = PriceAlertService.create(dbsession, "iPhone 15", 900.0)
+        alert = PriceTargetService.create(dbsession, "iPhone 15", 900.0)
 
         # Price above threshold - should not trigger
-        triggered = PriceAlertService.check_alerts(dbsession, quote.product, 950.0)
+        triggered = PriceTargetService.check(dbsession, quote.product, 950.0)
         assert len(triggered) == 0
 
         # Price at threshold - should trigger
-        triggered = PriceAlertService.check_alerts(dbsession, quote.product, 900.0)
+        triggered = PriceTargetService.check(dbsession, quote.product, 900.0)
         assert len(triggered) == 1
         assert triggered[0].id == alert.id
         assert triggered[0].triggered_at is not None
@@ -245,9 +246,9 @@ class TestPriceAlertService:
         ProductService.create(dbsession, "iPhone 15", "Apple")
         quote = QuoteService.create(dbsession, "Amazon", "iPhone 15", 999.0)
 
-        alert = PriceAlertService.create(dbsession, "iPhone 15", 900.0)
+        alert = PriceTargetService.create(dbsession, "iPhone 15", 900.0)
 
-        triggered = PriceAlertService.check_alerts(dbsession, quote.product, 850.0)
+        triggered = PriceTargetService.check(dbsession, quote.product, 850.0)
         assert len(triggered) == 1
         assert triggered[0].id == alert.id
 
@@ -257,14 +258,14 @@ class TestPriceAlertService:
         ProductService.create(dbsession, "iPhone 15", "Apple")
         quote = QuoteService.create(dbsession, "Amazon", "iPhone 15", 999.0)
 
-        PriceAlertService.create(dbsession, "iPhone 15", 900.0)
+        PriceTargetService.create(dbsession, "iPhone 15", 900.0)
 
         # First trigger
-        triggered = PriceAlertService.check_alerts(dbsession, quote.product, 850.0)
+        triggered = PriceTargetService.check(dbsession, quote.product, 850.0)
         assert len(triggered) == 1
 
         # Second check should not trigger again
-        triggered = PriceAlertService.check_alerts(dbsession, quote.product, 800.0)
+        triggered = PriceTargetService.check(dbsession, quote.product, 800.0)
         assert len(triggered) == 0
 
     def test_get_active(self, dbsession):
@@ -272,13 +273,13 @@ class TestPriceAlertService:
         ProductService.create(dbsession, "iPhone 15", "Apple")
         ProductService.create(dbsession, "Galaxy S24", "Samsung")
 
-        alert1 = PriceAlertService.create(dbsession, "iPhone 15", 900.0)
-        alert2 = PriceAlertService.create(dbsession, "Galaxy S24", 1000.0)
+        alert1 = PriceTargetService.create(dbsession, "iPhone 15", 900.0)
+        alert2 = PriceTargetService.create(dbsession, "Galaxy S24", 1000.0)
 
         # Deactivate one
-        PriceAlertService.deactivate(dbsession, alert2.id)
+        PriceTargetService.deactivate(dbsession, alert2.id)
 
-        active = PriceAlertService.get_active(dbsession)
+        active = PriceTargetService.get_all(dbsession, active_only=True)
         assert len(active) == 1
         assert active[0].id == alert1.id
 
@@ -288,31 +289,92 @@ class TestPriceAlertService:
         ProductService.create(dbsession, "iPhone 15", "Apple")
         quote = QuoteService.create(dbsession, "Amazon", "iPhone 15", 999.0)
 
-        PriceAlertService.create(dbsession, "iPhone 15", 900.0)
-        PriceAlertService.create(dbsession, "iPhone 15", 800.0)
+        PriceTargetService.create(dbsession, "iPhone 15", 900.0)
+        PriceTargetService.create(dbsession, "iPhone 15", 800.0)
 
         # Trigger one
-        PriceAlertService.check_alerts(dbsession, quote.product, 850.0)
+        PriceTargetService.check(dbsession, quote.product, 850.0)
 
-        triggered = PriceAlertService.get_triggered(dbsession)
+        triggered = PriceTargetService.get_triggered(dbsession)
         assert len(triggered) == 1
-        assert triggered[0].threshold_value == 900.0
+        assert triggered[0].threshold == 900.0
 
     def test_deactivate(self, dbsession):
         """Deactivate an alert"""
         ProductService.create(dbsession, "iPhone 15", "Apple")
-        alert = PriceAlertService.create(dbsession, "iPhone 15", 900.0)
+        alert = PriceTargetService.create(dbsession, "iPhone 15", 900.0)
 
         assert alert.active == 1
 
-        updated = PriceAlertService.deactivate(dbsession, alert.id)
+        updated = PriceTargetService.deactivate(dbsession, alert.id)
 
         assert updated.active == 0
 
     def test_deactivate_not_found(self, dbsession):
         """Deactivate non-existent alert raises error"""
         with pytest.raises(NotFoundError, match="not found"):
-            PriceAlertService.deactivate(dbsession, 99999)
+            PriceTargetService.deactivate(dbsession, 99999)
+
+    def test_create_stores_currency_upper_case(self, dbsession):
+        ProductService.create(dbsession, "iPhone 15", "Apple")
+        target = PriceTargetService.create(dbsession, "iPhone 15", 800.0, "eur")
+        assert target.currency == "EUR"
+        assert target.label == "800.00 EUR"
+
+    def test_create_rejects_a_bad_currency(self, dbsession):
+        ProductService.create(dbsession, "iPhone 15", "Apple")
+        with pytest.raises(ValidationError, match="3 characters"):
+            PriceTargetService.create(dbsession, "iPhone 15", 800.0, "EURO")
+
+    def test_create_rejects_the_same_active_target(self, dbsession):
+        ProductService.create(dbsession, "iPhone 15", "Apple")
+        PriceTargetService.create(dbsession, "iPhone 15", 800.0)
+        with pytest.raises(DuplicateError):
+            PriceTargetService.create(dbsession, "iPhone 15", 800.0)
+
+    def test_update_re_arms_a_fired_target(self, dbsession):
+        VendorService.create(dbsession, "Amazon", currency="USD")
+        quote = QuoteService.create(
+            dbsession, "Amazon", "iPhone 15", 999.0, brand_name="Apple"
+        )
+        target = PriceTargetService.create(dbsession, "iPhone 15", 900.0)
+        PriceTargetService.check(dbsession, quote.product, 850.0)
+        assert target.triggered_at is not None
+
+        PriceTargetService.update(dbsession, target.id, threshold=800.0)
+
+        assert target.threshold == 800.0
+        assert target.triggered_at is None
+
+    def test_update_with_nothing_raises(self, dbsession):
+        ProductService.create(dbsession, "iPhone 15", "Apple")
+        target = PriceTargetService.create(dbsession, "iPhone 15", 900.0)
+        with pytest.raises(ValidationError, match="Nothing to update"):
+            PriceTargetService.update(dbsession, target.id)
+
+    def test_met_now_writes_nothing(self, dbsession):
+        VendorService.create(dbsession, "Amazon", currency="USD")
+        QuoteService.create(dbsession, "Amazon", "iPhone 15", 850.0, brand_name="Apple")
+        met = PriceTargetService.create(dbsession, "iPhone 15", 900.0)
+        PriceTargetService.create(dbsession, "iPhone 15", 800.0)
+
+        assert PriceTargetService.met_now(dbsession) == [met]
+        assert met.triggered_at is None
+
+    def test_met_now_skips_inactive_and_unconvertible(self, dbsession):
+        VendorService.create(dbsession, "Amazon", currency="USD")
+        QuoteService.create(dbsession, "Amazon", "iPhone 15", 50.0, brand_name="Apple")
+        off = PriceTargetService.create(dbsession, "iPhone 15", 900.0)
+        PriceTargetService.deactivate(dbsession, off.id)
+        PriceTargetService.create(dbsession, "iPhone 15", 100.0, "JPY")
+
+        assert PriceTargetService.met_now(dbsession) == []
+
+    def test_delete(self, dbsession):
+        ProductService.create(dbsession, "iPhone 15", "Apple")
+        target = PriceTargetService.create(dbsession, "iPhone 15", 900.0)
+        PriceTargetService.delete(dbsession, target.id)
+        assert PriceTargetService.get_all(dbsession) == []
 
 
 # QuoteService extension tests
@@ -372,20 +434,21 @@ class TestQuoteServiceExtensions:
         assert history[0].new_value == 899.0
         assert history[1].change_type == "create"
 
-    def test_update_price_triggers_alert(self, dbsession):
-        """Updating price triggers relevant alerts"""
+    def test_update_price_leaves_targets_for_check(self, dbsession):
+        """A price edit must not fire a target, or `check` never reports it."""
+        from buylog.services import MonitorService
+
         VendorService.create(dbsession, "Amazon", currency="USD")
         ProductService.create(dbsession, "iPhone 15", "Apple")
         quote = QuoteService.create(dbsession, "Amazon", "iPhone 15", 999.0)
+        target = PriceTargetService.create(dbsession, "iPhone 15", 900.0)
 
-        alert = PriceAlertService.create(dbsession, "iPhone 15", 900.0)
-
-        # Update price below threshold
         QuoteService.update_price(dbsession, quote.id, 850.0)
 
-        # Check alert was triggered
-        dbsession.refresh(alert)
-        assert alert.triggered_at is not None
+        assert target.triggered_at is None
+        assert PriceTargetService.met_now(dbsession) == [target]
+        findings = MonitorService.check(dbsession)
+        assert [item["target"] for item in findings["targets"]] == [target]
 
     def test_update_price_not_found(self, dbsession):
         """Update price for non-existent quote raises error"""

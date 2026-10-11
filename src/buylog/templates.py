@@ -104,7 +104,7 @@ def vendor_import(session, data: dict) -> Any:
     return VendorService.create(
         session,
         name=data["name"],
-        currency=data.get("currency", "USD"),
+        currency=data.get("currency"),  # None: the base currency
         discount_code=data.get("discount_code"),
         discount=data.get("discount", 0.0),
         url=data.get("url"),
@@ -225,7 +225,7 @@ def purchase_order_template(
             "product": from_quote.product.name,
             "quantity": 1,
             "unit_price": from_quote.value,
-            "currency": from_quote.currency,
+            "currency": from_quote.base_currency,  # from_quote.value is in it
             "shipping_cost": from_quote.shipping_cost,
             "tax": None,
             "order_date": today,
@@ -287,7 +287,7 @@ def purchase_order_import(session, data: dict) -> Any:
         product_name=data["product"],
         unit_price=float(data["unit_price"]),
         quantity=int(data.get("quantity", 1)),
-        currency=data.get("currency", "USD"),
+        currency=data.get("currency"),  # None: the vendor's currency
         quote_id=data.get("quote_id"),
         order_date=_parse_date(data.get("order_date")),
         expected_delivery=_parse_date(data.get("expected_delivery")),
