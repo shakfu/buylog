@@ -1,5 +1,7 @@
 """Textual TUI interface for buylog tool"""
 
+import datetime
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -1003,6 +1005,11 @@ class AddSpecificationScreen(Screen[dict | None]):
         self.dismiss(None)
 
 
+def _form_date(value: str) -> datetime.date | None:
+    """A YYYY-MM-DD form field as a date; blank is None."""
+    return datetime.date.fromisoformat(value.strip()) if value.strip() else None
+
+
 class AddPurchaseOrderScreen(Screen[dict | None]):
     """Full-screen form for adding a purchase order."""
 
@@ -1022,8 +1029,19 @@ class AddPurchaseOrderScreen(Screen[dict | None]):
         yield Header()
         with Vertical(id="fullscreen-form"):
             title = "[bold]Add Purchase Order[/bold]"
+            prefill = {"currency": "", "shipping": "", "tax": ""}
             if self.from_quote:
                 title += f" (from Quote #{self.from_quote.id})"
+                shipping = self.from_quote.shipping_cost
+                unit_price, tax = PurchaseOrderService.quote_pricing(
+                    self.from_quote, 1, shipping
+                )
+                # quote amounts are in the base, not the vendor's currency
+                prefill = {
+                    "currency": self.from_quote.base_currency,
+                    "shipping": f"{shipping:.2f}" if shipping else "",
+                    "tax": f"{tax:.2f}" if tax else "",
+                }
             yield Label(title, id="form-title")
 
             with VerticalScroll(id="form-scroll-full"):
@@ -1052,7 +1070,7 @@ class AddPurchaseOrderScreen(Screen[dict | None]):
                         )
                     with Horizontal(classes="form-row"):
                         yield Label("Unit Price", classes="form-label")
-                        yield Input(value=str(self.from_quote.value), id="unit-price")
+                        yield Input(value=f"{unit_price:.2f}", id="unit-price")
                 else:
                     with Horizontal(classes="form-row"):
                         yield Label("Vendor *", classes="form-label")
@@ -1069,15 +1087,23 @@ class AddPurchaseOrderScreen(Screen[dict | None]):
                     yield Input(placeholder="1", value="1", id="quantity")
                 with Horizontal(classes="form-row"):
                     yield Label("Currency", classes="form-label")
-                    yield Input(placeholder="Vendor's currency", id="currency")
+                    yield Input(
+                        placeholder="Vendor's currency",
+                        value=prefill["currency"],
+                        id="currency",
+                    )
 
                 yield Label("[bold]Costs[/bold]", classes="section-header")
                 with Horizontal(classes="form-row"):
                     yield Label("Shipping", classes="form-label")
-                    yield Input(placeholder="0.00", id="shipping-cost")
+                    yield Input(
+                        placeholder="0.00",
+                        value=prefill["shipping"],
+                        id="shipping-cost",
+                    )
                 with Horizontal(classes="form-row"):
                     yield Label("Tax", classes="form-label")
-                    yield Input(placeholder="0.00", id="tax")
+                    yield Input(placeholder="0.00", value=prefill["tax"], id="tax")
 
                 yield Label("[bold]Dates[/bold]", classes="section-header")
                 today = datetime.date.today().isoformat()
@@ -1118,9 +1144,11 @@ class AddPurchaseOrderScreen(Screen[dict | None]):
                 )
                 or None,
                 "tax": float(self.query_one("#tax", Input).value or 0) or None,
-                "order_date": self.query_one("#order-date", Input).value or None,
-                "expected_delivery": self.query_one("#expected-delivery", Input).value
-                or None,
+                # The service stores dates; a raw string fails the insert.
+                "order_date": _form_date(self.query_one("#order-date", Input).value),
+                "expected_delivery": _form_date(
+                    self.query_one("#expected-delivery", Input).value
+                ),
                 "invoice_number": self.query_one("#invoice-number", Input).value
                 or None,
                 "notes": self.query_one("#notes", Input).value or None,

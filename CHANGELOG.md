@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Quote import ignored the row currency for existing vendors.** Amounts were converted from the vendor's currency, so re-importing a quotes CSV export (base amounts) for a non-base vendor stored wrong prices and shipping. The row's `currency` now wins; files without the column still use the vendor's currency.
+- **`po add --from-quote` dropped the quote's discount and tax.** The PO took the list price, so its total differed from the quote's. It now takes the discounted price and the quote's tax rate, applied to the goods for the ordered quantity plus shipping. `--shipping` and `--tax` still override. The PO template from a quote pre-fills the same price and tax.
+- **Adding a PO in the TUI failed unless the order date was cleared.** The form passed its dates as strings, which the database rejects.
+- **`vendor merge` and `product merge` lost or blocked dependent records.** A purchase order on the merged entity failed the merge on its foreign key. Product features and price targets were deleted with the merged product. Vendor brand links were dropped, and notes and tags were orphaned. All now move to the kept entity. On a conflict, the kept entity's feature value or tag wins.
+
 ## [0.3.0]
 
 ### Upgrading

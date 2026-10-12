@@ -2339,7 +2339,7 @@ class PurchaseOrderService:
             order_date: Optional order date
             expected_delivery: Optional expected delivery date
             shipping_cost: Optional shipping cost (overrides quote if provided)
-            tax: Optional tax amount
+            tax: Optional tax amount (overrides the quote's tax rate if provided)
             notes: Optional notes
 
         Returns:
@@ -2358,21 +2358,37 @@ class PurchaseOrderService:
         effective_shipping = (
             shipping_cost if shipping_cost is not None else quote.shipping_cost
         )
+        unit_price, quote_tax = PurchaseOrderService.quote_pricing(
+            quote, quantity, effective_shipping
+        )
 
         return PurchaseOrderService.create(
             session=session,
             po_number=po_number,
             vendor_name=quote.vendor.name,
             product_name=quote.product.name,
-            unit_price=quote.value,
+            unit_price=unit_price,
             quantity=quantity,
             currency=get_base_currency(session),  # quote.value is in the base
             quote_id=quote_id,
             order_date=order_date,
             expected_delivery=expected_delivery,
             shipping_cost=effective_shipping,
-            tax=tax,
+            tax=tax if tax is not None else quote_tax,
             notes=notes,
+        )
+
+    @staticmethod
+    def quote_pricing(
+        quote: Quote, quantity: int, shipping: Optional[float]
+    ) -> tuple[float, Optional[float]]:
+        """Discounted unit price and tax amount, matching ``Quote.total_cost``."""
+        unit_price = quote.value * (1 - (quote.discount or 0.0) / 100.0)
+        tax_rate = quote.tax_rate or 0.0
+        if not tax_rate:
+            return unit_price, None
+        return unit_price, (unit_price * quantity + (shipping or 0.0)) * (
+            tax_rate / 100.0
         )
 
     @staticmethod
@@ -2443,13 +2459,8 @@ class PurchaseOrderService:
             session.commit()
             return existing
 
-        discount = quote.discount or 0.0
-        unit_price = quote.value * (1 - discount / 100.0)
         shipping = quote.shipping_cost
-        tax_rate = quote.tax_rate or 0.0
-        tax = (
-            (unit_price + (shipping or 0.0)) * (tax_rate / 100.0) if tax_rate else None
-        )
+        unit_price, tax = PurchaseOrderService.quote_pricing(quote, 1, shipping)
 
         return PurchaseOrderService.create(
             session=session,
@@ -3464,7 +3475,7 @@ class ImportService:
         product_name = row.get("product", "").strip()
         brand_name = row.get("brand", "").strip()
         price_str = row.get("price", "").strip()
-        currency = row.get("currency", "").strip().upper() or get_base_currency(session)
+        currency = row.get("currency", "").strip().upper()
         shipping_str = row.get("shipping", "").strip()
         tax_rate_str = row.get("tax_rate", "").strip()
 
@@ -3488,7 +3499,9 @@ class ImportService:
             if not vendor:
                 if not create_missing:
                     raise NotFoundError(f"Vendor not found: {vendor_name}")
-                vendor = Vendor(name=vendor_name, currency=currency)
+                vendor = Vendor(
+                    name=vendor_name, currency=currency or get_base_currency(session)
+                )
                 session.add(vendor)
                 session.flush()
                 result["created_vendor"] = vendor_name
@@ -3512,16 +3525,17 @@ class ImportService:
                 session.flush()
                 result["created_product"] = product_name
 
-            # Normalize to the base. A missing rate is an error, matching
+            # Amounts are in the row's currency; the export writes base amounts
+            # whatever the vendor's currency. Files without the column fall back
+            # to the vendor's. A missing rate is an error, matching
             # QuoteService.create - storing a foreign price as a base amount
             # silently corrupts every later comparison.
+            row_currency = currency or vendor.currency
             value, original_value, original_currency = ForexService.to_base(
-                session, price, vendor.currency
+                session, price, row_currency
             )
             if shipping is not None:
-                shipping, _, _ = ForexService.to_base(
-                    session, shipping, vendor.currency
-                )
+                shipping, _, _ = ForexService.to_base(session, shipping, row_currency)
 
             quote = Quote(
                 vendor=vendor,
@@ -4087,13 +4101,44 @@ class DeduplicationService:
         return intersection / union if union > 0 else 0.0
 
     @staticmethod
+    def _reassign_notes_and_tags(
+        session: Session, entity_type: str, from_id: int, to_id: int
+    ) -> None:
+        """Move notes and tags between entities; drop tags the target has."""
+        for note in session.scalars(
+            select(Note).where(
+                Note.entity_type == entity_type, Note.entity_id == from_id
+            )
+        ).all():
+            note.entity_id = to_id
+        kept_tags = set(
+            session.scalars(
+                select(EntityTag.tag_id).where(
+                    EntityTag.entity_type == entity_type, EntityTag.entity_id == to_id
+                )
+            )
+        )
+        for et in session.scalars(
+            select(EntityTag).where(
+                EntityTag.entity_type == entity_type, EntityTag.entity_id == from_id
+            )
+        ).all():
+            if et.tag_id in kept_tags:
+                session.delete(et)
+            else:
+                et.entity_id = to_id
+
+    @staticmethod
     def merge_vendors(
         session: Session,
         keep_id: int,
         merge_ids: List[int],
     ) -> Vendor:
         """
-        Merge multiple vendors into one, reassigning all quotes.
+        Merge multiple vendors into one.
+
+        Quotes, purchase orders, brands, notes, and tags move to the kept
+        vendor. A tag both vendors carry is kept once.
 
         Args:
             session: Database session
@@ -4116,12 +4161,20 @@ class DeduplicationService:
                 if not merge_vendor:
                     continue
 
-                # Reassign quotes
-                for quote in merge_vendor.quotes:
-                    quote.vendor_id = keep_id
+                # Copy the list: reassigning removes each quote from it.
+                for quote in list(merge_vendor.quotes):
                     quote.vendor = keep_vendor
+                for po in session.scalars(
+                    select(PurchaseOrder).where(PurchaseOrder.vendor_id == merge_id)
+                ).all():
+                    po.vendor = keep_vendor
+                for brand in merge_vendor.brands:
+                    if brand not in keep_vendor.brands:
+                        keep_vendor.brands.append(brand)
+                DeduplicationService._reassign_notes_and_tags(
+                    session, "vendor", merge_id, keep_id
+                )
 
-                # Delete merged vendor
                 session.delete(merge_vendor)
 
             session.commit()
@@ -4139,7 +4192,11 @@ class DeduplicationService:
         merge_ids: List[int],
     ) -> Product:
         """
-        Merge multiple products into one, reassigning all quotes.
+        Merge multiple products into one.
+
+        Quotes, purchase orders, price targets, features, notes, and tags move
+        to the kept product. Where both products have a value for the same
+        feature or carry the same tag, the kept product's is kept.
 
         Args:
             session: Database session
@@ -4162,12 +4219,26 @@ class DeduplicationService:
                 if not merge_product:
                     continue
 
-                # Reassign quotes
-                for quote in merge_product.quotes:
-                    quote.product_id = keep_id
+                # Copy the lists: reassigning removes each item from them.
+                for quote in list(merge_product.quotes):
                     quote.product = keep_product
+                for target in list(merge_product.price_targets):
+                    target.product = keep_product
+                kept_features = {
+                    f.specification_feature_id for f in keep_product.features
+                }
+                for feature in list(merge_product.features):
+                    if feature.specification_feature_id not in kept_features:
+                        feature.product = keep_product
+                for po in session.scalars(
+                    select(PurchaseOrder).where(PurchaseOrder.product_id == merge_id)
+                ).all():
+                    po.product = keep_product
+                DeduplicationService._reassign_notes_and_tags(
+                    session, "product", merge_id, keep_id
+                )
 
-                # Delete merged product
+                # Cascades delete the features the kept product already had.
                 session.delete(merge_product)
 
             session.commit()

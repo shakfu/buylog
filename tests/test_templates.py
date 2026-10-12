@@ -205,6 +205,25 @@ def test_purchase_order_template_from_quote(dbsession):
     assert tpl["vendor"] == "Amazon"
     assert tpl["product"] == "iPhone 15"
     assert tpl["unit_price"] == 999.99
+    assert tpl["tax"] is None
+
+
+def test_purchase_order_template_from_quote_applies_discount_and_tax(dbsession):
+    """Template pre-fills sum to the quote's total cost."""
+    VendorService.create(dbsession, "Amazon", currency="USD")
+    ProductService.create(dbsession, "iPhone 15", "Apple")
+    quote = QuoteService.create(
+        dbsession, "Amazon", "iPhone 15", 200.0, shipping_cost=20.0, tax_rate=10.0
+    )
+    quote.discount = 25.0
+    dbsession.commit()
+
+    tpl = purchase_order_template(from_quote=quote)
+
+    assert tpl["unit_price"] == pytest.approx(150.0)
+    assert tpl["tax"] == pytest.approx(17.0)
+    po = purchase_order_import(dbsession, {**tpl, "po_number": "PO-T1"})
+    assert po.grand_total == pytest.approx(quote.total_cost)
 
 
 def test_purchase_order_template_str_yaml():

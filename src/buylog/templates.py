@@ -216,6 +216,9 @@ def purchase_order_template(
     today = datetime.date.today().isoformat()
 
     if from_quote:
+        unit_price, tax = PurchaseOrderService.quote_pricing(
+            from_quote, 1, from_quote.shipping_cost
+        )
         return {
             "_comment": f"Pre-filled from quote #{from_quote.id}. Adjust as needed.",
             "po_number": po_number
@@ -224,10 +227,10 @@ def purchase_order_template(
             "vendor": from_quote.vendor.name,
             "product": from_quote.product.name,
             "quantity": 1,
-            "unit_price": from_quote.value,
+            "unit_price": unit_price,
             "currency": from_quote.base_currency,  # from_quote.value is in it
             "shipping_cost": from_quote.shipping_cost,
-            "tax": None,
+            "tax": tax,
             "order_date": today,
             "expected_delivery": None,
             "invoice_number": None,

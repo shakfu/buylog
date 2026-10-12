@@ -7,9 +7,27 @@ from pathlib import Path
 
 import pytest
 
-from buylog.models import Brand, Product, Vendor, Quote
+import datetime
+
+from buylog.models import (
+    Brand,
+    EntityTag,
+    Forex,
+    Note,
+    PriceTarget,
+    Product,
+    ProductFeature,
+    PurchaseOrder,
+    Quote,
+    Specification,
+    SpecificationFeature,
+    Tag,
+    Vendor,
+)
 from buylog.services import (
     ImportService,
+    PurchaseOrderService,
+    QuoteService,
     ExportService,
     BackupService,
     DeduplicationService,
@@ -129,6 +147,65 @@ class TestImportService:
         # Should have errors because vendors/products don't exist
         assert stats["skipped"] > 0
         assert len(stats["errors"]) > 0
+
+    def _eur_vendor(self, dbsession, product):
+        dbsession.add(
+            Forex(code="EUR", date=datetime.date(2026, 1, 1), base_per_unit=1.25)
+        )
+        dbsession.add(Vendor(name="EuroShop", currency="EUR"))
+        dbsession.commit()
+
+    def _import(self, dbsession, content):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write(content)
+        try:
+            return ImportService.import_quotes_csv(dbsession, f.name)
+        finally:
+            os.unlink(f.name)
+
+    def test_import_csv_uses_row_currency(self, dbsession, product):
+        """A row's currency wins over the existing vendor's currency."""
+        self._eur_vendor(dbsession, product)
+        stats = self._import(
+            dbsession,
+            "vendor,product,brand,price,currency,shipping\n"
+            "EuroShop,TestProduct,TestBrand,100,USD,10\n",
+        )
+        assert stats["imported"] == 1, stats["errors"]
+        q = dbsession.query(Quote).one()
+        assert q.value == pytest.approx(100.0)
+        assert q.shipping_cost == pytest.approx(10.0)
+        assert q.original_currency is None
+
+    def test_import_csv_without_currency_uses_vendor(self, dbsession, product):
+        """Files without a currency column keep the vendor-currency behaviour."""
+        self._eur_vendor(dbsession, product)
+        stats = self._import(
+            dbsession,
+            "vendor,product,brand,price,shipping\nEuroShop,TestProduct,TestBrand,100,8\n",
+        )
+        assert stats["imported"] == 1, stats["errors"]
+        q = dbsession.query(Quote).one()
+        assert q.value == pytest.approx(125.0)
+        assert q.shipping_cost == pytest.approx(10.0)
+        assert q.original_value == pytest.approx(100.0)
+        assert q.original_currency == "EUR"
+
+    def test_export_import_round_trip_foreign_vendor(self, dbsession, product):
+        """Exported base amounts re-import unchanged for a non-base vendor."""
+        self._eur_vendor(dbsession, product)
+        original = QuoteService.create(
+            dbsession, "EuroShop", "TestProduct", 80.0, shipping_cost=4.0
+        )
+        csv_text = ExportService.export_quotes_csv(dbsession)
+        dbsession.delete(original)
+        dbsession.commit()
+
+        stats = self._import(dbsession, csv_text)
+        assert stats["imported"] == 1, stats["errors"]
+        q = dbsession.query(Quote).one()
+        assert q.value == pytest.approx(100.0)
+        assert q.shipping_cost == pytest.approx(5.0)
 
     def test_import_csv_file_not_found(self, dbsession):
         """Test that importing non-existent file raises error."""
@@ -424,6 +501,103 @@ class TestDeduplicationService:
 
         # p2 should be deleted
         assert dbsession.get(Product, p2.id) is None
+
+    def test_merge_vendors_moves_dependents(self, dbsession, product):
+        """Quotes, POs, brands, notes, and tags follow the kept vendor."""
+        v1 = Vendor(name="Keep", currency="USD")
+        v2 = Vendor(name="Gone", currency="USD")
+        other = Brand(name="OtherBrand")
+        v2.brands.append(other)
+        dbsession.add_all([v1, v2])
+        dbsession.flush()
+        dbsession.add_all(
+            [
+                Quote(product=product, vendor=v2, value=100.0),
+                Quote(product=product, vendor=v2, value=110.0),
+            ]
+        )
+        dbsession.commit()
+        PurchaseOrderService.create(
+            dbsession, "PO-M1", "Gone", "TestProduct", unit_price=100.0
+        )
+        shared, extra = Tag(name="shared"), Tag(name="extra")
+        dbsession.add_all([shared, extra])
+        dbsession.flush()
+        dbsession.add_all(
+            [
+                Note(entity_type="vendor", entity_id=v2.id, content="call first"),
+                EntityTag(tag=shared, entity_type="vendor", entity_id=v1.id),
+                EntityTag(tag=shared, entity_type="vendor", entity_id=v2.id),
+                EntityTag(tag=extra, entity_type="vendor", entity_id=v2.id),
+            ]
+        )
+        dbsession.commit()
+        gone_id = v2.id
+
+        result = DeduplicationService.merge_vendors(dbsession, v1.id, [gone_id])
+
+        assert dbsession.get(Vendor, gone_id) is None
+        assert len(result.quotes) == 2
+        po = dbsession.query(PurchaseOrder).filter_by(po_number="PO-M1").one()
+        assert po.vendor_id == v1.id
+        assert other in result.brands
+        note = dbsession.query(Note).one()
+        assert note.entity_id == v1.id
+        tags = dbsession.query(EntityTag).filter_by(entity_type="vendor").all()
+        assert sorted(t.tag.name for t in tags) == ["extra", "shared"]
+        assert all(t.entity_id == v1.id for t in tags)
+
+    def test_merge_products_moves_dependents(self, dbsession, brand, vendor):
+        """POs, targets, features, notes, and tags follow the kept product."""
+        p1 = Product(name="Keep", brand=brand)
+        p2 = Product(name="Gone", brand=brand)
+        spec = Specification(name="Spec")
+        color = SpecificationFeature(specification=spec, name="color")
+        weight = SpecificationFeature(
+            specification=spec, name="weight", data_type="number"
+        )
+        dbsession.add_all([p1, p2, spec])
+        dbsession.flush()
+        dbsession.add_all(
+            [
+                ProductFeature(
+                    product=p1, specification_feature=color, value_text="red"
+                ),
+                ProductFeature(
+                    product=p2, specification_feature=color, value_text="blue"
+                ),
+                ProductFeature(
+                    product=p2, specification_feature=weight, value_number=2.0
+                ),
+                PriceTarget(product=p2, threshold=50.0),
+                Quote(product=p2, vendor=vendor, value=60.0),
+                Quote(product=p2, vendor=vendor, value=70.0),
+                Note(entity_type="product", entity_id=p2.id, content="fragile"),
+            ]
+        )
+        dbsession.commit()
+        PurchaseOrderService.create(
+            dbsession, "PO-M2", "TestVendor", "Gone", unit_price=60.0
+        )
+        tag = Tag(name="t")
+        dbsession.add(tag)
+        dbsession.flush()
+        dbsession.add(EntityTag(tag=tag, entity_type="product", entity_id=p2.id))
+        dbsession.commit()
+        gone_id = p2.id
+
+        result = DeduplicationService.merge_products(dbsession, p1.id, [gone_id])
+
+        assert dbsession.get(Product, gone_id) is None
+        assert len(result.quotes) == 2
+        po = dbsession.query(PurchaseOrder).filter_by(po_number="PO-M2").one()
+        assert po.product_id == p1.id
+        assert [t.threshold for t in result.price_targets] == [50.0]
+        features = {f.specification_feature.name: f.value for f in result.features}
+        assert features == {"color": "red", "weight": 2.0}
+        assert dbsession.query(ProductFeature).count() == 2
+        assert dbsession.query(Note).one().entity_id == p1.id
+        assert dbsession.query(EntityTag).one().entity_id == p1.id
 
     def test_merge_nonexistent_vendor_raises(self, dbsession):
         """Test that merging nonexistent vendor raises error."""

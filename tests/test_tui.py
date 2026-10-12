@@ -218,6 +218,36 @@ async def test_target_form_returns_the_currency(seeded):
         assert results == [("iPhone 15", 800.0, "EUR")]
 
 
+async def test_po_form_from_quote_matches_quote_total(seeded):
+    """Pre-fills carry the quote's discount, shipping, tax, and currency."""
+    from textual.widgets import Input
+
+    from buylog.models import PurchaseOrder, Quote
+
+    app = seeded.BuyerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        quote = app.session.query(Quote).one()
+        quote.value, quote.discount = 200.0, 25.0
+        quote.shipping_cost, quote.tax_rate = 20.0, 10.0
+        app.session.commit()
+
+        results = []
+        screen = seeded.AddPurchaseOrderScreen(from_quote=quote)
+        await app.push_screen(screen, results.append)
+        await pilot.pause()
+        assert screen.query_one("#unit-price", Input).value == "150.00"
+        assert screen.query_one("#currency", Input).value == "USD"
+        assert screen.query_one("#shipping-cost", Input).value == "20.00"
+        assert screen.query_one("#tax", Input).value == "17.00"
+        screen.action_save()
+        await pilot.pause()
+
+        app._on_purchase_order_added(results[0])
+        po = app.session.query(PurchaseOrder).one()
+        assert po.grand_total == pytest.approx(quote.total_cost)
+
+
 async def test_tab_specific_keys_follow_the_active_tab(tui):
     """Footer keys that do nothing on a tab are disabled there."""
     app = tui.BuyerApp()

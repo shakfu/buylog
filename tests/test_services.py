@@ -755,6 +755,36 @@ def test_purchase_order_service_create_from_quote(dbsession):
     assert po.product.name == "iPhone 15"
 
 
+def test_purchase_order_from_quote_matches_quote_total(dbsession):
+    """Discount, shipping, and tax carry over, so the PO total is the quote's."""
+    from buylog.services import PurchaseOrderService
+
+    VendorService.create(dbsession, "Amazon", currency="USD")
+    ProductService.create(dbsession, "iPhone 15", "Apple")
+    quote = QuoteService.create(
+        dbsession, "Amazon", "iPhone 15", 200.0, shipping_cost=20.0, tax_rate=10.0
+    )
+    quote.discount = 25.0
+    dbsession.commit()
+
+    po = PurchaseOrderService.create_from_quote(dbsession, "PO-Q1", quote.id)
+    assert po.unit_price == pytest.approx(150.0)
+    assert po.tax == pytest.approx(17.0)
+    assert po.grand_total == pytest.approx(quote.total_cost)
+
+    # Tax scales with the goods, not the per-order shipping.
+    po3 = PurchaseOrderService.create_from_quote(
+        dbsession, "PO-Q3", quote.id, quantity=3
+    )
+    assert po3.grand_total == pytest.approx((450.0 + 20.0) * 1.1)
+
+    # Explicit overrides still win.
+    po_o = PurchaseOrderService.create_from_quote(
+        dbsession, "PO-QO", quote.id, shipping_cost=0.0, tax=5.0
+    )
+    assert po_o.grand_total == pytest.approx(155.0)
+
+
 def test_purchase_order_service_create_from_quote_not_found(dbsession):
     """Test creating PO from non-existent quote raises error"""
     from buylog.services import PurchaseOrderService
